@@ -189,7 +189,7 @@ if prompt:
     # Send context to GPT
     messages = (
         st.session_state.messages +
-        [AIMessage(f"This is the spec for product {st.session_state.last_product_number}:\n{st.session_state.last_context}")] +
+        [SystemMessage(f"This is the specification for product {st.session_state.last_product_number}:\n{st.session_state.last_context}")] +
         [HumanMessage(prompt)]
     )
 
