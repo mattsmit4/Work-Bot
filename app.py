@@ -1,260 +1,205 @@
-# imports streamlit and setup
 import streamlit as st
 import os
 from dotenv import load_dotenv
-from datetime import datetime
+import re
+import string
 
-# import pinecone
-from pinecone import Pinecone, ServerlessSpec
-
-# import langchain
+from pinecone import Pinecone
 from langchain_pinecone import PineconeVectorStore
 from langchain_openai import OpenAIEmbeddings, ChatOpenAI
 from langchain_core.messages import HumanMessage, SystemMessage, AIMessage
 
 load_dotenv()
-
-# Streamlit app title
 st.title("StarTech.com Products Chatbot")
 
-# initialize pinecone database
-pc = Pinecone(api_key=os.environ.get("PINECONE_API_KEY"))
-index_name = os.environ.get("PINECONE_INDEX_NAME")
-index = pc.Index(index_name)
+# Fallback trigger phrases for vague follow-up questions
+fallback_keywords = [
+    "what color", "what colours", "what colour", "what type", "what kind", "how big", "how small", "how long",
+    "how wide", "how tall", "how thick", "how heavy", "how many", "how much", "what size", "what sizes", "does it",
+    "is it", "are they", "specs", "details", "specifications", "tech specs", "technical details",
+    "what ports", "which ports", "what connectors", "which connectors", "what inputs", "what outputs",
+    "how fast", "what speed", "what resolution", "is this compatible", "is this supported", "will this work",
+    "can i use this", "can it", "is there", "do they", "what’s included", "what is included", "what do you get",
+    "included accessories", "in the box", "what’s in the box", "what comes with", "do i need", "will it help", 
+    "does it require", "will it fit", "will it keep", "what version", "any differences", "any difference", 
+    "difference between"
+]
 
-# initialize embeddings model + vector store
-embeddings = OpenAIEmbeddings(model="text-embedding-3-large", api_key=os.environ.get("OPENAI_API_KEY"))
-vector_store = PineconeVectorStore(index=index, embedding=embeddings)
+# Phrases to detect user exit
+farewell_keywords = [
+    "thank you", "thanks", "appreciate it", "cheers", "bye", "goodbye", "see you", 
+    "you’ve been helpful", "you have been helpful", "that’s all", "that is all"
+]
 
-# Synonym map for fuzzy phrase matching
-synonym_map = {
-    # Core technical terms
-    "mean time between failures": "mtbf",
-    "what's in the box": "package contents",
-    "what comes in the box": "package contents",
-    "included in the box": "package contents",
-    "package includes": "package contents",
+# -------------------- CACHED RESOURCES --------------------
 
-    # Dimensions & weight
-    "how big is it": "product dimensions",
-    "how large is it": "product dimensions",
-    "product size": "product dimensions",
-    "how much does it weigh": "weight",
-    "how heavy is it": "weight",
-    "device weight": "weight",
-    "box weight": "shipping weight",
+@st.cache_resource
+def load_vector_store():
+    pc = Pinecone(api_key=os.environ["PINECONE_API_KEY"])
+    index = pc.Index(os.environ["PINECONE_INDEX_NAME"])
+    embeddings = OpenAIEmbeddings(model="text-embedding-3-large", api_key=os.environ["OPENAI_API_KEY"])
+    return PineconeVectorStore(index=index, embedding=embeddings)
 
-    # Power
-    "power usage": "power consumption",
-    "how much power does it use": "power consumption",
-    "power draw": "power consumption",
-    "wattage": "power consumption",
-    "power delivery": "power delivery",
-    "does it charge": "power delivery",
-    "fast charging": "fast charging support",
+@st.cache_resource
+def load_llm():
+    return ChatOpenAI(model="gpt-4o", temperature=0.7)
 
-    # Compatibility
-    "what os does it support": "os compatibility",
-    "operating system compatibility": "os compatibility",
-    "compatible with mac": "os compatibility",
-    "windows support": "os compatibility",
-    "linux compatible": "os compatibility",
+vector_store = load_vector_store()
+llm = load_llm()
 
-    # Video
-    "screen resolution": "max resolution",
-    "max video resolution": "max resolution",
-    "display resolution": "max resolution",
-    "4k support": "4k display support",
-    "ultra hd": "4k display support",
-    "display ratio": "aspect ratio",
+# -------------------- UTILS --------------------
 
-    # Connectivity
-    "number of ports": "total ports",
-    "total number of ports": "total ports",
-    "how many ports": "total ports",
-    "usb ports": "number of usb ports",
-    "display connectors": "external ports",
-    "input connector": "connector a",
-    "output connector": "connector b",
-    "host connection": "host connector",
-    "host interface": "host connector",
+def extract_product_number(text):
+    match = re.search(r"\b(?=[A-Z0-9-]{6,}\b)(?=[A-Z0-9-]*\d)[A-Z0-9-]+\b", text)
+    return match.group(0) if match else None
 
-    # Mounting & rack
-    "is it wall mountable": "wall mountable",
-    "can it be mounted": "mount options",
-    "rack compatible": "rack mountable",
-    "rack height": "rack height (u)",
-    "vesa support": "vesa pattern",
+def is_vague_follow_up(prompt):
+    clean = prompt.lower().translate(str.maketrans('', '', string.punctuation))
+    return len(clean.strip().split()) <= 4 or any(kw in prompt.lower() for kw in fallback_keywords)
 
-    # Network & PoE
-    "does it support poe": "poe support",
-    "power over ethernet": "poe support",
-    "network speed": "network speed",
-    "ethernet speed": "network speed",
+def is_farewell(prompt):
+    return any(kw in prompt.lower() for kw in farewell_keywords)
 
-    # Standards / certifications
-    "compliance": "compliance standards",
-    "safety rating": "cable rating",
-    "certifications": "whql certified",
+def show_response(reply):
+    with st.chat_message("assistant"):
+        st.markdown(reply)
+    st.session_state.messages.append(AIMessage(reply))
 
-    # Other
-    "locking slot": "security slot support",
-    "is it wireless": "wireless capability",
-    "led light": "led indicators",
-    "data rate": "max data rate",
-    "max distance": "max transmission distance",
-    "supported displays": "number of displays",
-}
+# -------------------- HANDLERS --------------------
 
-def replace_synonyms(text):
-    lowered = text.lower()
-    for phrase, replacement in synonym_map.items():
-        if phrase in lowered:
-            lowered = lowered.replace(phrase, replacement)
-    return lowered
+def handle_greeting(prompt):
+    greeting_keywords = ["hello", "hi", "hey", "good morning", "good afternoon", "good evening"]
+    if not st.session_state.greeted_user and any(word in prompt.lower() for word in greeting_keywords):
+        reply = (
+            "Hi there! 👋 I'm here to help you find the right StarTech.com product.\n\n"
+            "You can ask me about product specs, features, or tell me what you're trying to do and I’ll recommend something that fits."
+        )
+        show_response(reply)
+        st.session_state.greeted_user = True
+        return True
+    return False
 
-# Initialize session state
+def handle_farewell(prompt):
+    if is_farewell(prompt):
+        show_response("Thank you for reaching out! If you have any more questions or need further assistance, feel free to ask. I'm here to help!")
+        return True
+    return False
+
+def handle_explicit_product(prompt):
+    product_number = extract_product_number(prompt)
+    if product_number:
+        docs_with_scores = vector_store.similarity_search_with_score(prompt, k=1)
+        if docs_with_scores:
+            top_doc, score = docs_with_scores[0]
+            st.session_state.last_product_number = top_doc.metadata.get("product_number", "")
+            st.session_state.last_context = top_doc.page_content
+            st.session_state.last_score = score
+        return True
+    return False
+
+def handle_vague_followup(prompt):
+    if is_vague_follow_up(prompt):
+        if not st.session_state.last_context:
+            reply = (
+                "Could you tell me a bit more about what you're looking for? For example:\n"
+                "- Is there a specific problem you are trying to solve?\n"
+                "- What specs in a product are important to you?\n"
+                "- What do you want the product to connect to or be compatible with?\n\n"
+                "You can also mention a product number if you already have one in mind."
+            )
+            show_response(reply)
+            return True
+        else:
+            st.session_state.last_score = 1.0
+    return False
+
+def handle_descriptive_query(prompt):
+    docs_with_scores = vector_store.similarity_search_with_score(prompt, k=1)
+    if docs_with_scores:
+        top_doc, score = docs_with_scores[0]
+        if score >= 0.4:
+            st.session_state.last_product_number = top_doc.metadata.get("product_number", "")
+            st.session_state.last_context = top_doc.page_content
+            st.session_state.last_score = score
+        return True
+    return False
+
+# -------------------- SESSION STATE --------------------
+
 if "messages" not in st.session_state:
-    st.session_state.messages = []
-    st.session_state.messages.append(SystemMessage("""
-You are Dot, the official and knowledgeable virtual assistant for StarTech.com.
-
-Your job is to recommend the most suitable StarTech.com product based on the structured product catalog and the user's technical requirements.
-
-Use only the information retrieved from the embedded product data. Do not guess or make assumptions.
-
-If the user provides enough technical detail (e.g., port types, display count, OS, usage scenario), retrieve the best-matching product from the catalog and include its product number and title in your response.
-
-If multiple products are a match, recommend only the most relevant one and encourage the user to refine further if needed.
-
-Keep your answers concise (1–3 sentences), and ask follow-up questions if the user is vague.
-
-Do not store personal or sensitive info, and only assist with StarTech.com product selection.
-"""))
-
-if "retrieved_contexts" not in st.session_state:
-    st.session_state.retrieved_contexts = []
-
-if "last_product_chunk" not in st.session_state:
-    st.session_state.last_product_chunk = ""
-
+    st.session_state.messages = [
+        SystemMessage(
+            "You are a StarTech.com assistant. Always be friendly and professional. "
+            "You only answer questions about StarTech.com products using the provided context. "
+            "Do not mention or recommend products from any other company, supplier, or brand — only StarTech.com. "
+            "Do not make up information. If you’re unsure, ask for clarification. "
+            "Stay helpful, polite, and focused on StarTech.com solutions."
+        )
+    ]
 if "last_product_number" not in st.session_state:
-    st.session_state.last_product_number = None
+    st.session_state.last_product_number = ""
+if "last_context" not in st.session_state:
+    st.session_state.last_context = ""
+if "last_score" not in st.session_state:
+    st.session_state.last_score = None
+if "greeted_user" not in st.session_state:
+    st.session_state.greeted_user = False
 
-# Display chat messages from history
-for message in st.session_state.messages:
-    if isinstance(message, SystemMessage):
+# -------------------- CHAT FLOW --------------------
+
+# Render previous messages
+for msg in st.session_state.messages:
+    if isinstance(msg, SystemMessage):
         continue
-    with st.chat_message("user" if isinstance(message, HumanMessage) else "assistant"):
-        st.markdown(message.content)
+    with st.chat_message("user" if isinstance(msg, HumanMessage) else "assistant"):
+        st.markdown(msg.content)
 
-# Chat input
-prompt = st.chat_input("How can I help you?")
+prompt = st.chat_input("Ask about a StarTech.com product")
 
 if prompt:
+    st.session_state.messages.append(HumanMessage(prompt))
     with st.chat_message("user"):
         st.markdown(prompt)
-        st.session_state.messages.append(HumanMessage(prompt))
 
-    greetings = ["yo", "hey", "hello", "hi", "greetings", "good morning", "good afternoon"]
-    if prompt.lower().strip() in greetings:
-        greeting_response = (
-            "Hi there! I'm Dot, your StarTech.com product assistant. 😊\n\n"
-            "How can I help you today?\n"
-            "For the best results, please be specific about any technical questions or StarTech.com products that you have in mind."
+    if handle_greeting(prompt): st.stop()
+    if handle_farewell(prompt): st.stop()
+    if handle_explicit_product(prompt): pass
+    elif handle_vague_followup(prompt): st.stop()
+    else: handle_descriptive_query(prompt)
+
+    if not st.session_state.last_context:
+        show_response(
+            "Could you tell me a bit more about what you're looking for? For example:\n"
+            "- Is there a specific problem you are trying to solve?\n"
+            "- What specs in a product are important to you?\n"
+            "- What do you want the product to connect to or be compatible with?\n\n"
+            "You can also mention a product number if you already have one in mind."
         )
-        with st.chat_message("assistant"):
-            st.markdown(greeting_response)
-            st.session_state.messages.append(AIMessage(greeting_response))
         st.stop()
 
-    llm = ChatOpenAI(model="gpt-4o", temperature=1)
+    # 🧠 Debug
+    print("\n--- Debug Info ---")
+    print(f"User Prompt: {prompt}")
+    print(f"Product Number: {st.session_state.last_product_number}")
+    print(f"Similarity Score: {st.session_state.last_score if st.session_state.last_score is not None else 'N/A'}")
+    print("Context Retrieved:")
+    print(st.session_state.last_context)
+    print("-------------------\n")
 
-    fallback_keywords = [
-        "what is", "what's", "how many", "how much", "which one", "what model", "what sku", "do you have it",
-        "aspect ratio", "material", "what comes included", "in the box", "weight", "color", "colour", "what color", "what colour",
-        "resolution", "ports", "features", "included", "does it have", "what's the",
-        "what type", "what kind", "what cable", "tell me more", "specs", "specifications"
-    ]
-    is_follow_up = any(x in prompt.lower() for x in fallback_keywords)
-
-    metadata_filter = {}
-    if is_follow_up and st.session_state.last_product_number:
-        st.session_state.retrieved_contexts.append(
-            f"Previously referenced product number: {st.session_state.last_product_number}"
-        )
-
-    # Replace synonyms before retrieval
-    rewritten_prompt = replace_synonyms(prompt)
-
-    retriever = vector_store.as_retriever(
-        search_type="similarity_score_threshold",
-        search_kwargs={
-            "k": 3,
-            "score_threshold": 0.4,
-            "filter": metadata_filter
-        },
+    # Send context to GPT
+    messages = (
+        st.session_state.messages +
+        [AIMessage(f"This is the spec for product {st.session_state.last_product_number}:\n{st.session_state.last_context}")] +
+        [HumanMessage(prompt)]
     )
 
-    docs = retriever.invoke(rewritten_prompt)
+    reply = llm.invoke(messages).content
 
-    if not docs:
-        no_results_message = (
-            "Sorry, I couldn't find relevant product information for your question.\n\n"
-            "You can try rephrasing or asking about a specific feature, product number, or port type."
-        )
-        with st.chat_message("assistant"):
-            st.markdown(no_results_message)
-            st.session_state.messages.append(AIMessage(no_results_message))
-    else:
-        docs_texts = [d.page_content[:3000] for d in docs[:3]]
+    # Detect multiple product numbers in response
+    product_numbers_in_reply = re.findall(r"\b(?=[A-Z0-9-]{6,}\b)(?=[A-Z0-9-]*\d)[A-Z0-9-]+\b", reply)
+    unique_product_numbers = list(set(product_numbers_in_reply))
+    if len(unique_product_numbers) > 1:
+        reply += "\n\n**Which product would you like to know more about?**"
+        print(f"[⚠️ Multiple product numbers mentioned]: {unique_product_numbers}")
 
-        # ✅ Only update product memory if this is NOT a vague follow-up
-        if not is_follow_up:
-            st.session_state.last_product_chunk = docs_texts[0]
-            first_doc = docs[0]
-            product_id = first_doc.metadata.get("product_number")
-            if product_id:
-                st.session_state.last_product_number = product_id
-
-        st.session_state.retrieved_contexts.extend(docs_texts)
-        st.session_state.retrieved_contexts = st.session_state.retrieved_contexts[-3:]
-
-        if is_follow_up and st.session_state.last_product_chunk:
-            st.session_state.retrieved_contexts.insert(0, st.session_state.last_product_chunk)
-
-        # ✅ NEW: add assistant message history to context window
-        assistant_history = [m.content for m in st.session_state.messages if isinstance(m, AIMessage)]
-        st.session_state.retrieved_contexts.extend(assistant_history[-2:])  # Keep recent 2 responses max
-
-        system_prompt = """
-You are Dot, the official and knowledgeable virtual assistant for StarTech.com.
-
-Your job is to recommend the most suitable StarTech.com product based on the structured product catalog and the user's technical requirements.
-
-Use only the information retrieved from the embedded product data. Do not guess or make assumptions.
-
-If the user provides enough technical detail (e.g., port types, display count, OS, usage scenario), retrieve the best-matching product from the catalog and include its product number and title in your response.
-
-If multiple products are a match, recommend only the most relevant one and encourage the user to refine further if needed.
-
-Keep your answers concise (1–3 sentences), and ask follow-up questions if the user is vague.
-
-Do not store personal or sensitive info, and only assist with StarTech.com product selection.
-"""
-
-        combined_context = "\n\n".join(st.session_state.retrieved_contexts)
-
-        chat_with_context = [
-            SystemMessage(system_prompt),
-            *st.session_state.messages,
-            HumanMessage(content=f"{prompt}\n\nContext:\n{combined_context}" +
-                         (f"\n\nThe previous product being discussed is {st.session_state.last_product_number}."
-                          if is_follow_up and st.session_state.last_product_number else ""))
-        ]
-
-        result = llm.invoke(chat_with_context).content
-
-        with st.chat_message("assistant"):
-            st.markdown(result)
-            st.session_state.messages.append(AIMessage(result))
+    show_response(reply)
