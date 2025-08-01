@@ -69,7 +69,8 @@ def show_response(reply):
 
 def handle_greeting(prompt):
     greeting_keywords = ["hello", "hi", "hey", "good morning", "good afternoon", "good evening"]
-    if not st.session_state.greeted_user and any(word in prompt.lower() for word in greeting_keywords):
+    word_count = len(prompt.strip().split())
+    if not st.session_state.greeted_user and word_count <= 4 and any(word in prompt.lower() for word in greeting_keywords):
         reply = (
             "Hi there! 👋 I'm here to help you find the right StarTech.com product.\n\n"
             "You can ask me about product specs, features, or tell me what you're trying to do and I’ll recommend something that fits."
