@@ -31,6 +31,18 @@ farewell_keywords = [
     "you’ve been helpful", "you have been helpful", "that’s all", "that is all"
 ]
 
+# Metadata synonym mapping
+metadata_field_keywords = {
+    "totalports": ["total ports", "number of ports", "ports total", "how many ports"],
+    "dockusbports": ["usb ports", "number of usb ports"],
+    "weight of product": ["weight of product", "product weight", "how heavy", "weight"],
+    "shipping (package) weight": ["shipping weight"],
+    "docknumdisplays": ["screens", "monitors", "displays"],
+    "drivesize": ["drive size", "how big drive", "disk size"],
+    "maxresolution": ["resolution", "max resolution"],
+    "powerdelivery": ["power delivery", "wattage", "charging watts"]
+}
+
 # -------------------- CACHED RESOURCES --------------------
 
 @st.cache_resource
@@ -59,6 +71,18 @@ def is_vague_follow_up(prompt):
 
 def is_farewell(prompt):
     return any(kw in prompt.lower() for kw in farewell_keywords)
+
+def extract_filter_from_prompt(prompt):
+    query_lower = prompt.lower()
+    for field, keywords in metadata_field_keywords.items():
+        for keyword in keywords:
+            if keyword in query_lower:
+                # Match patterns like "100W", "80Gbps", "2.5A", etc.
+                match = re.search(r'(\d+(\.\d+)?)(\s?[a-z%]+)?', query_lower)
+                if match:
+                    value = float(match.group(1))
+                    return {field: int(value) if value.is_integer() else value}
+    return None
 
 def show_response(reply):
     with st.chat_message("assistant"):
@@ -89,12 +113,19 @@ def handle_farewell(prompt):
 def handle_explicit_product(prompt):
     product_number = extract_product_number(prompt)
     if product_number:
-        docs_with_scores = vector_store.similarity_search_with_score(prompt, k=1)
-        if docs_with_scores:
-            top_doc, score = docs_with_scores[0]
-            st.session_state.last_product_number = top_doc.metadata.get("product_number", "")
-            st.session_state.last_context = top_doc.page_content
-            st.session_state.last_score = score
+        docs = vector_store.similarity_search(
+            query="product spec",  # dummy query to satisfy API
+            k=5,
+            filter={"product_number": product_number.upper()}
+        )
+        if docs:
+            st.session_state.last_product_number = product_number.upper()
+            st.session_state.last_context = docs[0].page_content
+            st.session_state.last_score = 1.0
+        else:
+            st.session_state.last_product_number = ""
+            st.session_state.last_context = ""
+            st.session_state.last_score = 0.0
         return True
     return False
 
@@ -115,14 +146,22 @@ def handle_vague_followup(prompt):
     return False
 
 def handle_descriptive_query(prompt):
-    docs_with_scores = vector_store.similarity_search_with_score(prompt, k=1)
-    if docs_with_scores:
-        top_doc, score = docs_with_scores[0]
-        if score >= 0.4:
+    filter_dict = extract_filter_from_prompt(prompt)
+    try:
+        docs_with_scores = vector_store.similarity_search_with_score(
+            prompt,
+            k=5,
+            filter=filter_dict
+        )
+        docs_with_scores = [r for r in docs_with_scores if r[1] >= 0.2]
+        if docs_with_scores:
+            top_doc, score = docs_with_scores[0]
             st.session_state.last_product_number = top_doc.metadata.get("product_number", "")
             st.session_state.last_context = top_doc.page_content
             st.session_state.last_score = score
-        return True
+            return True
+    except Exception as e:
+        print(f"Metadata-filtered search failed: {e}")
     return False
 
 # -------------------- SESSION STATE --------------------
