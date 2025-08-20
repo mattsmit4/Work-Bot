@@ -1,3 +1,5 @@
+# v3_Work_Chatbot.py
+
 import streamlit as st
 import os, json, re, string
 from dotenv import load_dotenv
@@ -11,6 +13,27 @@ from difflib import get_close_matches
 load_dotenv()
 st.title("StarTech.com Products Chatbot")
 
+# ---- env helpers (consistent, safe) ----
+def env_required(name: str, hint: str = "") -> str:
+    v = os.environ.get(name)
+    if v is None or str(v).strip() == "":
+        raise RuntimeError(f"Missing environment variable '{name}'. {hint}")
+    return v
+
+def env_optional(name: str, default: str) -> str:
+    v = os.environ.get(name)
+    return default if v is None or str(v).strip() == "" else v
+
+# Required
+PINECONE_API_KEY = env_required("PINECONE_API_KEY")
+OPENAI_API_KEY = env_required("OPENAI_API_KEY")
+INDEX_NAME = env_required("PINECONE_INDEX_NAME")
+
+# Optional tunables
+CHAT_MODEL = env_optional("OPENAI_CHAT_MODEL", "gpt-4o")
+TEMP = float(env_optional("OPENAI_TEMPERATURE", "0.7"))
+EMBED_MODEL = env_optional("EMBED_MODEL", "text-embedding-3-large")
+
 # Fallback trigger phrases
 fallback_keywords = [
     "what color","what colours","what colour","what type","what kind","how big","how small","how long",
@@ -22,7 +45,18 @@ fallback_keywords = [
     "included accessories","in the box","what’s in the box","what comes with","do i need","will it help",
     "does it require","will it fit","will it keep","what version","any differences","any difference","difference between"
 ]
-farewell_keywords = ["thank you","thanks","appreciate it","cheers","bye","goodbye","see you","you’ve been helpful","you have been helpful","that’s all","that is all"]
+farewell_keywords = ["thank you","thanks","appreciate it","cheers","bye","goodbye","see you","you’ve been helpful","you have been helpful","that’s all","that is all", "cool"]
+
+# Step 6: compare/disambiguate triggers
+compare_keywords = ["compare", "difference between", "differences", "which one", "vs", "versus"]
+
+# NEW: installation / troubleshooting intents to block
+install_keywords = [
+    "install", "installation", "set up", "setup", "configure", "configuration",
+    "how do i connect", "wiring", "mount it", "mounting steps", "pair", "pairing",
+    "firmware", "driver install", "troubleshoot", "troubleshooting", "fix", "repair",
+    "update firmware", "how to use", "step by step", "steps"
+]
 
 # numeric metadata keywords
 metadata_field_keywords = {
@@ -35,54 +69,81 @@ metadata_field_keywords = {
 }
 
 # ---------- cached resources ----------
+def _mtime(path:str)->float:
+    return os.path.getmtime(path) if os.path.exists(path) else 0.0
+
 @st.cache_resource
-def load_vector_store():
-    pc = Pinecone(api_key=os.environ["PINECONE_API_KEY"])
-    index = pc.Index(os.environ["PINECONE_INDEX_NAME"])
-    embeddings = OpenAIEmbeddings(model="text-embedding-3-large", api_key=os.environ["OPENAI_API_KEY"])
+def load_vector_store(index_name:str, embed_model:str, pinecone_key:str, openai_key:str):
+    pc = Pinecone(api_key=pinecone_key)
+    index = pc.Index(index_name)
+    embeddings = OpenAIEmbeddings(model=embed_model, api_key=openai_key)
     return PineconeVectorStore(index=index, embedding=embeddings)
 
 @st.cache_resource
-def load_llm():
-    return ChatOpenAI(model="gpt-4o", temperature=0.7)
+def load_llm(chat_model:str, temperature:float, openai_key:str):
+    os.environ["OPENAI_API_KEY"] = openai_key  # be explicit
+    return ChatOpenAI(model=chat_model, temperature=temperature)
 
 @st.cache_resource
-def load_categorical_values():
+def load_categorical_values(mtime:float):
     path = "documents/categorical_values.json"
     if os.path.exists(path):
         with open(path, "r", encoding="utf-8") as f:
             data = json.load(f)
-            data.setdefault("category", [])
-            data.setdefault("subcategory", [])
-            data.setdefault("material", [])
-            data.setdefault("fiberduplex", [])
-            data.setdefault("fibertype", [])
-            data.setdefault("material_tags", [])
-            data.setdefault("color", [])
-            data.setdefault("wireless", [])
+            for k in ["category","subcategory","material","fiberduplex","fibertype","material_tags","color","wireless",
+                      "interface","mounting_options"]:
+                data.setdefault(k, [])
             return data
     return {
-        "category": [],
-        "subcategory": [],
-        "material": [],
-        "fiberduplex": [],
-        "fibertype": [],
-        "material_tags": [],
-        "color": [],
-        "wireless": [],
+        "category": [], "subcategory": [], "material": [], "fiberduplex": [], "fibertype": [],
+        "material_tags": [], "color": [], "wireless": [], "interface": [], "mounting_options": []
     }
 
-vector_store = load_vector_store()
-llm = load_llm()
-categorical_values = load_categorical_values()
+@st.cache_resource
+def load_sku_vocab(mtime:float):
+    path = "documents/sku_vocab.json"
+    try:
+        with open(path, "r", encoding="utf-8") as f:
+            data = json.load(f)
+            skus = [s.upper() for s in data.get("skus", [])]
+            sku_set = set(skus)
+            sku_map_nohyphen = {}
+            for s in skus:
+                sku_map_nohyphen.setdefault(s.replace("-", ""), s)
+            return sku_set, sku_map_nohyphen
+    except Exception:
+        return set(), {}
+
+vector_store = load_vector_store(INDEX_NAME, EMBED_MODEL, PINECONE_API_KEY, OPENAI_API_KEY)
+llm = load_llm(CHAT_MODEL, TEMP, OPENAI_API_KEY)
+categorical_values = load_categorical_values(_mtime("documents/categorical_values.json"))
+sku_set, sku_map_nohyphen = load_sku_vocab(_mtime("documents/sku_vocab.json"))
 
 # ---------- utils ----------
 def norm_text(s):
     return s.lower().translate(str.maketrans('', '', string.punctuation)).strip()
 
+def extract_product_numbers(text):
+    """Return all SKU mentions using vocab-first, hyphen-insensitive matching."""
+    if not text: return []
+    txt = text.upper()
+    cands = re.findall(r"[A-Z0-9-]{3,}", txt)
+    out, seen = [], set()
+    for cand in cands:
+        match = None
+        if cand in sku_set:
+            match = cand
+        else:
+            ch = cand.replace("-", "")
+            match = sku_map_nohyphen.get(ch)
+        if match and match not in seen:
+            seen.add(match)
+            out.append(match)
+    return out
+
 def extract_product_number(text):
-    m = re.search(r"\b(?=[A-Z0-9-]{6,}\b)(?=[A-Z0-9-]*\d)[A-Z0-9-]+\b", text)
-    return m.group(0) if m else None
+    arr = extract_product_numbers(text)
+    return arr[0] if arr else None
 
 def is_vague_follow_up(prompt):
     if extract_product_number(prompt):  # explicit product ref => not vague
@@ -94,6 +155,10 @@ def is_farewell(prompt):
     p = norm_text(prompt)
     return any(k in p for k in farewell_keywords)
 
+def is_install_request(prompt):
+    p = norm_text(prompt)
+    return any(k in p for k in install_keywords)
+
 def try_match_categorical(meta_key: str, prompt_norm: str):
     values = categorical_values.get(meta_key, [])
     for v in values:
@@ -101,10 +166,9 @@ def try_match_categorical(meta_key: str, prompt_norm: str):
         v_norm = norm_text(v_raw)
         if v_norm and v_norm in prompt_norm:
             return v_raw
-    matches = get_close_matches(prompt_norm, [str(v).strip().lower() for v in values], n=1, cutoff=0.92)
+    matches = get_close_matches(prompt_norm, [str(v).strip().lower() for v in values], n=1, cutoff=0.85)
     return matches[0] if matches else None
 
-# NEW: infer yes/no for wireless from natural phrasing
 def infer_wireless_from_prompt(prompt_norm: str):
     mentions = any(tok in prompt_norm for tok in ["wireless", "wifi", "wi fi"])
     if not mentions:
@@ -190,6 +254,97 @@ def show_response(reply):
         st.markdown(reply)
     st.session_state.messages.append(AIMessage(reply))
 
+# --------- Step 6: compare/disambiguation helpers ----------
+def _summarize_doc(doc):
+    md = doc.metadata or {}
+    return {
+        "Product Number": md.get("product_number", ""),
+        "Category": md.get("category", ""),
+        "Subcategory": md.get("subcategory", ""),
+        "Material": md.get("material", ""),
+        "Color": md.get("color", ""),
+        "Ports": md.get("ports", ""),
+        "Displays": md.get("displays", ""),
+        "Ethernet Speed": md.get("ethernet speed", ""),
+        "Max Distance": md.get("max distance", ""),
+        "Fiber Duplex": md.get("fiberduplex", ""),
+        "Fiber Type": md.get("fibertype", ""),
+        "Wireless": md.get("wireless", ""),
+        "Interface": md.get("interface", ""),
+        "Mounting": md.get("mounting_options", ""),
+    }
+
+def _markdown_table(rows:list[dict], cols:list[str])->str:
+    header = "| " + " | ".join(cols) + " |"
+    sep = "| " + " | ".join(["---"]*len(cols)) + " |"
+    body_lines = []
+    for r in rows:
+        body_lines.append("| " + " | ".join(str(r.get(c, "") or "") for c in cols) + " |")
+    return "\n".join([header, sep] + body_lines)
+
+def show_compare_for_products(pnums:list[str], prompt_hint:str=""):
+    docs = []
+    for pn in pnums:
+        try:
+            res = vector_store.similarity_search(query="product spec", k=1, filter={"product_number": pn})
+            if res:
+                docs.append(res[0])
+        except Exception as e:
+            print(f"Compare fetch failed for {pn}: {e}")
+    if not docs:
+        return False
+    rows = [_summarize_doc(d) for d in docs]
+    cols = ["Product Number","Category","Subcategory","Ports","Displays","Ethernet Speed","Max Distance","Material","Color","Interface","Mounting"]
+    table_md = _markdown_table(rows, cols)
+    with st.chat_message("assistant"):
+        st.markdown("I found multiple relevant products. Here’s a quick compare:")
+        st.markdown(table_md)
+        st.markdown("**Reply with a product number** to dive deeper.")
+    st.session_state.messages.append(AIMessage(f"Compare candidates shown: {', '.join([r['Product Number'] for r in rows])}. {prompt_hint}"))
+    # mark that we are waiting for a user's SKU pick
+    st.session_state.pending_compare = True
+    return True
+
+# --------- Step 7: structured answer rendering + safety ---------
+def render_structured_answer(prompt_text:str)->str:
+    pn = st.session_state.last_product_number or "(unknown)"
+    messages = (
+        st.session_state.messages +
+        [SystemMessage(
+            "SCOPE: You are a StarTech.com product assistant. "
+            "You ONLY provide product information, specs, compatibility, and high-level recommendations. "
+            "You DO NOT provide installation, configuration, wiring, firmware, or troubleshooting steps. "
+            "If asked for those, politely decline and recommend contacting StarTech.com Technical Support."
+        )] +
+        [SystemMessage(
+            f"CONTENT SAFETY: Answer ONLY about the single StarTech.com product number {pn}. "
+            "Do not mention, invent, or guess other product numbers or product names. "
+            "Use ONLY facts present in the SPECIFICATION block below; if a fact is missing, say: "
+            "'That information isn't in the spec I have.'"
+        )] +
+        [SystemMessage(
+            "FORMAT: Return Markdown. Start each heading on its own line:\n"
+            "Product: <PRODUCT NUMBER>\n"
+            "### Overview\n"
+            "### Key specs\n"
+            "### In the box (only if present)\n"
+            "### Notes (caveats/limits if present)\n"
+            "Do NOT reference non-StarTech brands."
+        )] +
+        [SystemMessage(f"SPECIFICATION:\n{st.session_state.last_context}")] +
+        [HumanMessage(prompt_text)]
+    )
+    return llm.invoke(messages).content
+
+# --- Markdown tidy so '###' never appears inline ---
+def fix_markdown_headings(md: str) -> str:
+    md = re.sub(r'(Product:\s*[^\n]+)\s+###\s*', r'\1\n\n### ', md, flags=re.IGNORECASE)
+    md = re.sub(r'(?<!\n)###\s+', r'\n\n### ', md)
+    return md.strip()
+
+def sanitize_reply(reply:str)->str:
+    return reply
+
 # ---------- handlers ----------
 def handle_greeting(prompt):
     greeting_keywords = ["hello","hi","hey","good morning","good afternoon","good evening"]
@@ -206,12 +361,35 @@ def handle_farewell(prompt):
         return True
     return False
 
+def handle_install_block(prompt):
+    if is_install_request(prompt):
+        pn = st.session_state.last_product_number
+        base = ("I can help with product selection, specs, and compatibility. "
+                "For installation, configuration, or troubleshooting, "
+                "please refer to the official documentation or contact StarTech.com Technical Support.")
+        if pn:
+            show_response(f"{base}\n\nIf you share more about your setup, I can confirm whether **{pn}** fits your needs.")
+        else:
+            show_response(base)
+        return True
+    return False
+
 def handle_explicit_product(prompt):
-    pn = extract_product_number(prompt)
-    if pn:
-        docs = vector_store.similarity_search(query="product spec", k=5, filter={"product_number": pn.upper()})
+    pnums = extract_product_numbers(prompt)
+    if len(pnums) >= 2:
+        print(f"Compare mode (explicit): {pnums[:3]}")
+        show_compare_for_products(pnums[:3], prompt_hint="Explicit compare.")
+        # Do NOT pick a product; clear context and wait for user SKU
+        st.session_state.last_product_number = ""
+        st.session_state.last_context = ""
+        st.session_state.last_score = None
+        st.session_state.last_metadata = {}
+        return "compare"
+    elif len(pnums) == 1:
+        pn = pnums[0]
+        docs = vector_store.similarity_search(query="product spec", k=5, filter={"product_number": pn})
         if docs:
-            st.session_state.last_product_number = pn.upper()
+            st.session_state.last_product_number = pn
             st.session_state.last_context = docs[0].page_content
             st.session_state.last_score = 1.0
             st.session_state.last_metadata = docs[0].metadata or {}
@@ -220,43 +398,60 @@ def handle_explicit_product(prompt):
             st.session_state.last_context = ""
             st.session_state.last_score = 0.0
             st.session_state.last_metadata = {}
-        return True
+        st.session_state.pending_compare = False
+        return "single"
     return False
 
-def handle_vague_followup(prompt):
-    if is_vague_follow_up(prompt):
-        if not st.session_state.last_context:
-            show_response(
-                "Could you tell me a bit more about what you're looking for? For example:\n"
-                "- Is there a specific problem you are trying to solve?\n"
-                "- What specs in a product are important to you?\n"
-                "- What do you want the product to connect to or be compatible with?\n\n"
-                "You can also mention a product number if you already have one in mind."
-            )
-            return True
-        st.session_state.last_score = 1.0
-        messages = (
-            st.session_state.messages +
-            [SystemMessage(f"This is the specification for product {st.session_state.last_product_number}:\n{st.session_state.last_context}")] +
-            [HumanMessage(prompt)]
+def handle_vague_follow_up(prompt):
+    """Respond to short/ambiguous follow-ups using the last retrieved product context."""
+    if not st.session_state.last_context:
+        show_response(
+            "Could you tell me a bit more about what you're looking for? For example:\n"
+            "- Is there a specific problem you are trying to solve?\n"
+            "- What specs in a product are important to you?\n"
+            "- What do you want the product to connect to or be compatible with?\n\n"
+            "You can also mention a product number if you already have one in mind."
         )
-        reply = llm.invoke(messages).content
-        show_response(reply)
         return True
-    return False
+    st.session_state.last_score = 1.0
+    reply = render_structured_answer(prompt)
+    reply = sanitize_reply(reply)
+    reply = fix_markdown_headings(reply)
+    show_response(reply)
+    return True
 
 def handle_descriptive_query(prompt):
+    prompt_norm = norm_text(prompt)
     f = extract_filter_from_prompt(prompt)
     try:
         results = vector_store.similarity_search_with_relevance_scores(prompt, k=5, filter=f)
         results = [(doc, score) for doc, score in results if score >= 0.35]
-        if results: return use_top_result(results)
+        if results:
+            uniq = []
+            seen = set()
+            for d, s in results:
+                pn = d.metadata.get("product_number","")
+                if pn and pn not in seen:
+                    seen.add(pn); uniq.append((d, s))
+            if len(uniq) >= 2 and (any(k in prompt_norm for k in compare_keywords) or abs(uniq[0][1] - uniq[1][1]) <= 0.06):
+                candidates = [d.metadata.get("product_number","") for d, _ in uniq[:3]]
+                print(f"Compare mode (tie/intent): {candidates}")
+                show_compare_for_products(candidates, prompt_hint="Close scores/compare intent.")
+                # Clear context; wait for user's SKU pick
+                st.session_state.last_product_number = ""
+                st.session_state.last_context = ""
+                st.session_state.last_score = None
+                st.session_state.last_metadata = {}
+                st.session_state.pending_compare = True
+                return "compare"
+            return use_top_result(results)
     except Exception as e:
         print(f"Metadata-filtered search failed: {e}")
 
     results = vector_store.similarity_search_with_relevance_scores(prompt, k=5)
     results = [(doc, score) for doc, score in results if score >= 0.35]
-    if results: return use_top_result(results)
+    if results:
+        return use_top_result(results)
     return False
 
 def use_top_result(results):
@@ -265,6 +460,7 @@ def use_top_result(results):
     st.session_state.last_context = top_doc.page_content
     st.session_state.last_score = score
     st.session_state.last_metadata = top_doc.metadata or {}
+    st.session_state.pending_compare = False
     return True
 
 # ---------- session state ----------
@@ -281,6 +477,7 @@ if "last_context" not in st.session_state: st.session_state.last_context = ""
 if "last_score" not in st.session_state: st.session_state.last_score = None
 if "greeted_user" not in st.session_state: st.session_state.greeted_user = False
 if "last_metadata" not in st.session_state: st.session_state.last_metadata = {}
+if "pending_compare" not in st.session_state: st.session_state.pending_compare = False
 
 # ---------- chat flow ----------
 for msg in st.session_state.messages:
@@ -294,11 +491,30 @@ if prompt:
     with st.chat_message("user"):
         st.markdown(prompt)
 
-    if handle_greeting(prompt): st.stop()
-    if handle_farewell(prompt): st.stop()
-    if handle_explicit_product(prompt): pass
-    elif handle_vague_followup(prompt): st.stop()
-    else: handle_descriptive_query(prompt)
+    # hard guard first: no installation / troubleshooting
+    if handle_install_block(prompt): st.stop()
+
+    # cleaned control flow
+    if handle_greeting(prompt) or handle_farewell(prompt):
+        st.stop()
+
+    handled = handle_explicit_product(prompt)
+    if handled == "compare":
+        # compare shown; wait for user to pick a product number
+        st.stop()
+
+    if not handled:
+        if is_vague_follow_up(prompt):
+            if handle_vague_follow_up(prompt):
+                st.stop()
+        else:
+            status = handle_descriptive_query(prompt)
+            if status == "compare":
+                st.stop()
+
+    # If we are pending a compare choice, don't show generic fallback or render anything
+    if st.session_state.pending_compare:
+        st.stop()
 
     if not st.session_state.last_context:
         show_response(
@@ -318,10 +534,22 @@ if prompt:
     print(f"Product Number: {st.session_state.last_product_number}")
     print(f"Similarity Score: {st.session_state.last_score if st.session_state.last_score is not None else 'N/A'}")
 
+    # SKU debug (prompt)
+    cand_prompt = re.findall(r"[A-Z0-9-]{3,}", prompt.upper())
+    unrec_prompt = []
+    for c in cand_prompt:
+        if c in sku_set: continue
+        ch = c.replace("-", "")
+        if ch not in sku_map_nohyphen:
+            unrec_prompt.append(c)
+    if unrec_prompt:
+        print("Unrecognized SKU-like tokens (prompt):", sorted(set(unrec_prompt))[:20])
+
     md = st.session_state.get("last_metadata") or {}
     interesting_keys = (
         "category", "subcategory", "material", "material_tags",
-        "fiberduplex", "fibertype", "ports", "displays", "color", "cablelength", "wireless"
+        "fiberduplex", "fibertype", "ports", "displays", "color", "cablelength", "wireless",
+        "interface", "mounting_options"
     )
 
     print("Resolved Metadata (top doc):")
@@ -333,15 +561,12 @@ if prompt:
     print(st.session_state.last_context)
     print("-------------------\n")
 
-    messages = (
-        st.session_state.messages +
-        [SystemMessage(f"This is the specification for product {st.session_state.last_product_number}:\n{st.session_state.last_context}")] +
-        [HumanMessage(prompt)]
-    )
-    reply = llm.invoke(messages).content
+    # As a safety net, don't render if we're somehow still pending a compare
+    if st.session_state.pending_compare:
+        st.stop()
 
-    pnums = re.findall(r"\b(?=[A-Z0-9-]{6,}\b)(?=[A-Z0-9-]*\d)[A-Z0-9-]+\b", reply)
-    if len(set(pnums)) > 1:
-        reply += "\n\n**Which product would you like to know more about?**"
-
+    # Structured answer + heading fix
+    reply = render_structured_answer(prompt)
+    reply = sanitize_reply(reply)
+    reply = fix_markdown_headings(reply)
     show_response(reply)
