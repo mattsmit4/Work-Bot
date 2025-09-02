@@ -1,0 +1,17 @@
+# --- Secrets ---
+.env
+
+# --- Local data (Excel, CSV, etc.) ---
+*.xlsx
+documents/*.xlsx
+
+# --- Python cache / temp ---
+__pycache__/
+*.pyc
+
+# --- Virtual environment ---
+.venv/
+
+# --- OS/editor junk ---
+.DS_Store
+Thumbs.db
