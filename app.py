@@ -1,5 +1,3 @@
-# v3_Work_Chatbot.py
-
 import streamlit as st
 import os, json, re, string
 from dotenv import load_dotenv
