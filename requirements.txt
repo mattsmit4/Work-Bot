@@ -1,6 +1,9 @@
 streamlit
-openai
-pinecone
 python-dotenv
+pandas
+openpyxl
+pinecone-client
 langchain
+langchain-openai
 langchain-pinecone
+tqdm
