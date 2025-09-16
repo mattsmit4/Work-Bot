@@ -11,6 +11,14 @@ from difflib import get_close_matches, SequenceMatcher
 load_dotenv()
 st.title("StarTech.com Products Chatbot")
 
+# --- hydrate env from Streamlit Cloud Secrets (without overwriting local .env) ---
+try:
+    for k, v in st.secrets.items():
+        os.environ.setdefault(str(k), str(v))
+except Exception:
+    # st.secrets isn't available when running locally with `streamlit run`
+    pass
+
 # ---- env helpers (consistent, safe) ----
 def env_required(name: str, hint: str = "") -> str:
     v = os.environ.get(name)
@@ -146,12 +154,9 @@ def extract_product_number(text):
     return arr[0] if arr else None
 
 # ---- Length formatting helper (mm -> friendly) ----
-# Tightened regex to avoid matching normal words (e.g., 'docking').
 _LEN_UNIT = r'\b(?:ft|feet|foot|in(?:ch(?:es)?)?|cm|centimeter(?:s)?|centimetre(?:s)?|m|meter(?:s)|metre(?:s)?)\b'
-# Number + unit detector (e.g., "6 ft", "1m", "12 inches")
 _NUM_UNIT = rf'\b\d+(?:\.\d+)?\s*{_LEN_UNIT}'
 
-# Detect common comparator phrases (incl. typos) OR raw symbols.
 _COMPARATOR_RE = re.compile(
     r'(?:'
     r'\bunder\b|\bbelow\b|'
@@ -171,10 +176,7 @@ def is_vague_follow_up(prompt):
     if extract_product_number(prompt):
         return False
     p = prompt.lower()
-    # Any number, real number+unit, or comparator phrase => not vague
-    if (re.search(r'\d', p) or
-        re.search(_NUM_UNIT, p) or
-        _COMPARATOR_RE.search(p)):
+    if (re.search(r'\d', p) or re.search(_NUM_UNIT, p) or _COMPARATOR_RE.search(p)):
         return False
     clean = norm_text(prompt)
     return len(clean.split()) <= 6 or any(k in clean for k in fallback_keywords)
@@ -212,11 +214,9 @@ def _tokset(s: str):
 def _meaningful_ngrams(prompt_norm: str):
     words = [w for w in prompt_norm.split() if w and w not in _STOPWORDS]
     grams = []
-    # multi-word n-grams (2..4)
     for n in range(2, min(4, len(words)) + 1):
         for i in range(len(words) - n + 1):
             grams.append(" ".join(words[i:i+n]))
-    # single words of length >= 4
     grams.extend([w for w in words if len(w) >= 4])
     return grams
 
@@ -225,7 +225,6 @@ def _fuzzy_pick_for_category(values: list[str], prompt_norm: str):
     if not grams:
         return None
     best_val, best_score = None, 0.0
-
     for v in values:
         v_norm = norm_text(v)
         vset = _tokset(v_norm)
@@ -238,11 +237,9 @@ def _fuzzy_pick_for_category(values: list[str], prompt_norm: str):
             overlap = len(vset & gset)
             if overlap == 0:
                 continue
-            cover_v = overlap / len(vset)          # how much of candidate covered by prompt
-            cover_g = overlap / len(gset)          # how much of n-gram covered by candidate
+            cover_v = overlap / len(vset)
+            cover_g = overlap / len(gset)
             char_sim = SequenceMatcher(None, v_norm, g).ratio()
-
-            # tight rule: 80% of candidate tokens present AND (60% of gram OR strong char sim)
             if cover_v >= 0.80 and (cover_g >= 0.60 or char_sim >= 0.86):
                 score = 0.6*cover_v + 0.2*cover_g + 0.2*char_sim
                 if score > best_score:
@@ -253,14 +250,10 @@ def try_match_categorical(meta_key: str, prompt_norm: str):
     values = [str(v).strip() for v in categorical_values.get(meta_key, []) if str(v).strip()]
     if not values:
         return None
-
-    # Tight fuzzy only for category/subcategory
     if meta_key in _FUZZY_KEYS:
         hit = _fuzzy_pick_for_category(values, prompt_norm)
         if hit:
             return hit
-
-    # Strict behavior for others (and fallback if fuzzy failed)
     for v in values:
         v_norm = norm_text(v)
         if v_norm and v_norm in prompt_norm:
@@ -316,7 +309,6 @@ def _pretty_mm(mm: float) -> str:
     return f"{f_s} ft [{m_s} m]"
 
 def _len_tol(mm: float) -> float:
-    """Tolerance for cable length matching (in mm). Use the larger of ±25mm or ±2%."""
     try:
         mm = float(mm)
     except Exception:
@@ -324,7 +316,6 @@ def _len_tol(mm: float) -> float:
     return max(25.0, mm * 0.02)
 
 def _satisfies_numeric(meta: dict, flt: dict) -> bool:
-    """Client-side check that a doc meets all numeric constraints (ranges + equality)."""
     def _to_num(x):
         if isinstance(x, (int, float)):
             return float(x)
@@ -378,15 +369,12 @@ def _satisfies_numeric(meta: dict, flt: dict) -> bool:
     return True
 
 def parse_global_range(prompt_norm: str):
-    """Parse general range language into Pinecone range ops for unit-less numerics."""
-    # between / from ... to|through|thru|-
     m = re.search(r'(?:between|from)\s*(\d+(?:\.\d+)?)\s*(?:and|to|through|thru|-)\s*(\d+(?:\.\d+)?)', prompt_norm)
     if m:
         a, b = float(m.group(1)), float(m.group(2))
         lo, hi = (a, b) if a <= b else (b, a)
         return {"$gte": lo, "$lte": hi}
 
-    # <= family
     m = re.search(
         r'(?:<=|=<|less\s+than\s+or\s+equal\s+to|at\s*most|atmost|no\s+more\s+(?:than|then)|'
         r'not\s+more\s+(?:than|then)|up\s*to|upto|no\s+greater\s+(?:than|then)|'
@@ -394,19 +382,16 @@ def parse_global_range(prompt_norm: str):
     if m:
         return {"$lte": float(m.group(1))}
 
-    # < family
     m = re.search(r'(?:<|less\s+(?:than|then)|under|below)\s*(\d+(?:\.\d+)?)', prompt_norm)
     if m:
         return {"$lt": float(m.group(1))}
 
-    # >= family
     m = re.search(
         r'(?:>=|=>|greater\s+than\s+or\s+equal\s+to|at\s*least|atleast|no\s+less\s+(?:than|then)|'
         r'not\s+less\s+(?:than|then)|min(?:imum)?(?:\s+of)?|min)\s*(\d+(?:\.\d+)?)', prompt_norm)
     if m:
         return {"$gte": float(m.group(1))}
 
-    # > family
     m = re.search(r'(?:>|greater\s+(?:than|then)|more\s+(?:than|then)|over|above)\s*(\d+(?:\.\d+)?)', prompt_norm)
     if m:
         return {"$gt": float(m.group(1))}
@@ -500,7 +485,7 @@ def extract_filter_from_prompt(prompt):
                 filters["cablelength"] = {"$gte": mm - tol, "$lte": mm + tol}
 
     # --- other numeric fields ---
-    rng_any = parse_global_range(prompt_norm)  # one parse covers common phrasing in the prompt
+    rng_any = parse_global_range(prompt_norm)
     for field, keywords in metadata_field_keywords.items():
         if field == "cablelength":
             continue
@@ -641,13 +626,11 @@ def handle_descriptive_query(prompt, f_override=None):
        When falling back, still enforce numeric constraints client-side."""
     f = f_override if f_override is not None else extract_filter_from_prompt(prompt)
 
-    # 1) Use metadata-filtered search first (use similarity_search here)
+    # 1) Use metadata-filtered search first
     try:
         if f:
-            # Filter-only search: the text query doesn't matter much when filters are tight
             docs = vector_store.similarity_search("product spec", k=50, filter=f)
             if docs:
-                # wrap in (doc, score) pairs for the existing helper
                 return use_top_result([(docs[0], 1.0)])
     except Exception as e:
         print(f"Metadata-filtered search failed: {e}")
@@ -658,7 +641,6 @@ def handle_descriptive_query(prompt, f_override=None):
     if not results:
         return False
 
-    # If the user implied numeric constraints, try to honor them client-side
     if f:
         for d, s in results:
             if _satisfies_numeric(d.metadata or {}, f):
@@ -667,7 +649,6 @@ def handle_descriptive_query(prompt, f_override=None):
         show_response("I couldn’t find a product that meets that requirement. If you can adjust it, I’ll try again.")
         return "no-match"
 
-    # No filter → just take the top result
     return use_top_result(results)
 
 def use_top_result(results):
@@ -705,31 +686,23 @@ if prompt:
     with st.chat_message("user"):
         st.markdown(prompt)
 
-    # hard guard first: no installation / troubleshooting
     if handle_install_block(prompt): st.stop()
-
-    if handle_greeting(prompt) or handle_farewell(prompt):
-        st.stop()
+    if handle_greeting(prompt) or handle_farewell(prompt): st.stop()
 
     handled = handle_explicit_product(prompt)
     if not handled:
         if is_vague_follow_up(prompt):
-            if handle_vague_follow_up(prompt):
-                st.stop()
+            if handle_vague_follow_up(prompt): st.stop()
         else:
-            # --- ALWAYS compute filters up front for debugging ---
             active_filters = extract_filter_from_prompt(prompt)
-
             status = handle_descriptive_query(prompt, f_override=active_filters)
 
-            # --- ALWAYS print debug, even on no-match/false ---
             print("\n--- Debug Info ---")
             print(f"Active Filters: {active_filters}")
             print(f"User Prompt: {prompt}")
             print(f"Product Number: {st.session_state.get('last_product_number') or ''}")
             print(f"Similarity Score: {st.session_state.get('last_score') if st.session_state.get('last_score') is not None else 'N/A'}")
 
-            # SKU debug (prompt)
             cand_prompt = re.findall(r"[A-Z0-9-]{3,}", prompt.upper())
             unrec_prompt = []
             for c in cand_prompt:
@@ -754,7 +727,6 @@ if prompt:
             print(st.session_state.get("last_context") or "(none)")
             print("-------------------\n")
 
-            # Now handle status outcomes
             if status == "no-match":
                 st.stop()
             elif status:
@@ -775,7 +747,6 @@ if prompt:
         )
         st.stop()
 
-    # (We keep a final debug print here too, for successful paths)
     final_filters = extract_filter_from_prompt(prompt)
     print("\n--- Debug Info ---")
     print(f"Active Filters: {final_filters}")
@@ -783,7 +754,6 @@ if prompt:
     print(f"Product Number: {st.session_state.last_product_number}")
     print(f"Similarity Score: {st.session_state.last_score if st.session_state.last_score is not None else 'N/A'}")
 
-    # SKU debug (prompt)
     cand_prompt = re.findall(r"[A-Z0-9-]{3,}", prompt.upper())
     unrec_prompt = []
     for c in cand_prompt:
