@@ -53,7 +53,6 @@ EMBED_MODEL = env_optional("EMBED_MODEL", "text-embedding-3-large")
 MODEL_DIMS = {
     "text-embedding-3-large": 3072,
     "text-embedding-3-small": 1536,
-    # add others here if you use them
 }
 EMBED_DIM = int(env_optional("EMBED_DIM", str(MODEL_DIMS.get(EMBED_MODEL, 3072))))
 
@@ -67,7 +66,6 @@ SLEEP_BETWEEN_BATCHES = env_optional_float("SLEEP_BETWEEN_BATCHES", 0.0)  # seco
 # ---- Pinecone setup ----
 pc = Pinecone(api_key=PINECONE_API_KEY)
 
-# list indexes, create if missing
 existing_indexes = [idx["name"] for idx in pc.list_indexes()]
 if INDEX_NAME not in existing_indexes:
     print(f"Creating Pinecone index '{INDEX_NAME}' (dim={EMBED_DIM}, metric=cosine, {PINECONE_CLOUD}/{PINECONE_REGION})...")
@@ -80,7 +78,6 @@ if INDEX_NAME not in existing_indexes:
     while not pc.describe_index(INDEX_NAME).status["ready"]:
         time.sleep(1)
 else:
-    # sanity-check index config
     desc = pc.describe_index(INDEX_NAME)
     serverless = desc.get("spec", {}).get("serverless", {})
     dim = desc.get("dimension")
@@ -140,25 +137,25 @@ print(f"Exported SKU vocab: {len(sku_vocab)} SKUs -> documents/sku_vocab.json")
 
 # --- Data fixes / transforms ---
 
-# Helper: pull first number from a string (e.g., "15 ports" -> 15.0)
 def num_or_none(x):
     if pd.isna(x):
         return None
     m = re.search(r'[-+]?\d+(?:\.\d+)?', str(x))
     return float(m.group(0)) if m else None
 
-# Ports: max of TOTALPORTS / NUMBERPORTS  (robust to strings like "15 ports")
+# Ports: max of TOTALPORTS / NUMBERPORTS / KVMPORTS
 totalports  = (df.get("TOTALPORTS")  if "TOTALPORTS"  in df.columns else pd.Series([None]*len(df))).apply(num_or_none)
 numberports = (df.get("NUMBERPORTS") if "NUMBERPORTS" in df.columns else pd.Series([None]*len(df))).apply(num_or_none)
-df["Ports"] = pd.concat([totalports, numberports], axis=1).max(axis=1)
+kvmports    = (df.get("KVMPORTS")    if "KVMPORTS"    in df.columns else pd.Series([None]*len(df))).apply(num_or_none)
+df["Ports"] = pd.concat([totalports, numberports, kvmports], axis=1).max(axis=1)
 
-# Displays: max of DOCKNUMDISPLAYS / NUMOFDISPLAY  (robust to strings)
+# Displays: max of DOCKNUMDISPLAYS / NUMOFDISPLAY
 docknumdisplays = (df.get("DOCKNUMDISPLAYS") if "DOCKNUMDISPLAYS" in df.columns else pd.Series([None]*len(df))).apply(num_or_none)
 numofdisplay    = (df.get("NUMOFDISPLAY")    if "NUMOFDISPLAY"    in df.columns else pd.Series([None]*len(df))).apply(num_or_none)
 df["Displays"]  = pd.concat([docknumdisplays, numofdisplay], axis=1).max(axis=1)
 
 # Drop the originals now that we've merged
-df.drop(columns=["TOTALPORTS", "NUMBERPORTS"], errors="ignore", inplace=True)
+df.drop(columns=["TOTALPORTS", "NUMBERPORTS", "KVMPORTS"], errors="ignore", inplace=True)
 df.drop(columns=["DOCKNUMDISPLAYS", "NUMOFDISPLAY"], errors="ignore", inplace=True)
 
 # ---- Build Material with priority: ENCLOSURETYPE -> CONSTMATERIAL -> AMZ_MAT ----
@@ -166,18 +163,14 @@ enc = df["ENCLOSURETYPE"] if "ENCLOSURETYPE" in df.columns else pd.Series([None]
 con = df["CONSTMATERIAL"] if "CONSTMATERIAL" in df.columns else pd.Series([None] * len(df))
 amz = df["AMZ_MAT"] if "AMZ_MAT" in df.columns else pd.Series([None] * len(df))
 
-# Treat empty strings as missing for merge logic
 enc_clean = enc.mask(enc.astype(str).str.strip() == "")
 con_clean = con.mask(con.astype(str).str.strip() == "")
 amz_clean = amz.mask(amz.astype(str).str.strip() == "")
 
-# Prioritized fill
 df["Material"] = enc_clean.fillna(con_clean).fillna(amz_clean)
-
-# Drop the source material columns now that Material exists
 df.drop(columns=["AMZ_MAT", "CONSTMATERIAL", "ENCLOSURETYPE"], errors="ignore", inplace=True)
 
-# ---- NEW: Build Interface with priority: IOINTERFACE -> KVMINTERFACE ----
+# ---- Interface (IOINTERFACE -> KVMINTERFACE) ----
 io_int = df["IOINTERFACE"] if "IOINTERFACE" in df.columns else pd.Series([None] * len(df))
 kvm_int = df["KVMINTERFACE"] if "KVMINTERFACE" in df.columns else pd.Series([None] * len(df))
 
@@ -185,11 +178,9 @@ io_clean = io_int.mask(io_int.astype(str).str.strip() == "")
 kvm_clean = kvm_int.mask(kvm_int.astype(str).str.strip() == "")
 
 df["Interface"] = io_clean.fillna(kvm_clean)
-
-# Drop the source columns now that Interface exists
 df.drop(columns=["IOINTERFACE", "KVMINTERFACE"], errors="ignore", inplace=True)
 
-# ---- NEW: Build Mounting Options with priority: MOUNTOPTIONS -> KVMRACKMOUNT -> RACKSPECFEAT ----
+# ---- Mounting Options (MOUNTOPTIONS -> KVMRACKMOUNT -> RACKSPECFEAT) ----
 mo = df["MOUNTOPTIONS"] if "MOUNTOPTIONS" in df.columns else pd.Series([None] * len(df))
 kvm_rm = df["KVMRACKMOUNT"] if "KVMRACKMOUNT" in df.columns else pd.Series([None] * len(df))
 mhole = df["RACKSPECFEAT"] if "RACKSPECFEAT" in df.columns else pd.Series([None] * len(df))
@@ -199,11 +190,9 @@ kvm_rm_clean = kvm_rm.mask(kvm_rm.astype(str).str.strip() == "")
 mhole_clean = mhole.mask(mhole.astype(str).str.strip() == "")
 
 df["Mounting Options"] = mo_clean.fillna(kvm_rm_clean).fillna(mhole_clean)
-
-# Drop the source columns now that Mounting Options exists
 df.drop(columns=["MOUNTOPTIONS", "KVMRACKMOUNT", "RACKSPECFEAT"], errors="ignore", inplace=True)
 
-# ---- NEW: Build Max Distance with priority: MAXTRANLENGTH -> MAXDISTANCE ----
+# ---- Max Distance (MAXTRANLENGTH -> MAXDISTANCE) ----
 tran_len = df["MAXTRANLENGTH"] if "MAXTRANLENGTH" in df.columns else pd.Series([None] * len(df))
 max_dist = df["MAXDISTANCE"] if "MAXDISTANCE" in df.columns else pd.Series([None] * len(df))
 
@@ -211,11 +200,9 @@ tran_len_clean = tran_len.mask(tran_len.astype(str).str.strip() == "")
 max_dist_clean = max_dist.mask(max_dist.astype(str).str.strip() == "")
 
 df["Max Distance"] = tran_len_clean.fillna(max_dist_clean)
-
-# Drop the source columns now that Max Distance exists
 df.drop(columns=["MAXTRANLENGTH", "MAXDISTANCE"], errors="ignore", inplace=True)
 
-# ---- NEW: Build Speed with priority: NETWORKSPEED -> DUPESPEED ----
+# ---- Ethernet Speed (NETWORKSPEED -> DUPESPEED) ----
 net_spd = df["NETWORKSPEED"] if "NETWORKSPEED" in df.columns else pd.Series([None] * len(df))
 dupe_spd = df["DUPESPEED"] if "DUPESPEED" in df.columns else pd.Series([None] * len(df))
 
@@ -223,8 +210,6 @@ net_spd_clean = net_spd.mask(net_spd.astype(str).str.strip() == "")
 dupe_spd_clean = dupe_spd.mask(dupe_spd.astype(str).str.strip() == "")
 
 df["Ethernet Speed"] = net_spd_clean.fillna(dupe_spd_clean)
-
-# Drop the source columns now that Speed exists
 df.drop(columns=["NETWORKSPEED", "DUPESPEED"], errors="ignore", inplace=True)
 
 # ---- Tokenize Material into tags for partial matching ----
@@ -257,7 +242,7 @@ CATEGORICAL_FIELDS = {
     "fibertype": "FIBERTYPE",
     "color": "COLOR",
     "wireless": "WIRELESS",
-    # Step 6 extras → available for compare/disambiguation:
+    # extras for context:
     "interface": "Interface",
     "mounting_options": "Mounting Options",
 }
@@ -270,7 +255,7 @@ for meta_key, col_name in CATEGORICAL_FIELDS.items():
     df[norm_col] = col.apply(norm_text)
     categorical_values[meta_key] = sorted([v for v in df[norm_col].dropna().unique()])
 
-# Add material tag vocabulary for the chatbot side filtering
+# Add material tag vocabulary for the chatbot
 tag_vocab = sorted({t for tags in df["_material_tags"] if isinstance(tags, list) for t in tags})
 categorical_values["material_tags"] = tag_vocab
 
@@ -296,7 +281,8 @@ fields = [
     "DRIVECONNECTOR", "MEDIATYPE", "HARDDRIVECOM", "INSERTIONRATE", "NUMHARDDRIVE", "CONNSTYLE", "NUMBERCONDUCTORS",
     "DRIVESIZE", "FRAMETYPE", "AVCABLING", "KVMCASCADABLE", "RATING", "LOCALCONNECTORS", "LADDERTYPE",
     "RACKTYPE", "CONDUCTORTYPE", "HOT_KEYS", "KVMCABLESINCLUDE", "MOUNTHOLETYPE",
-    "KVMCONCONSOLE", "KVMIPCONTROL", "KVMPCVIDEO", "KVMPORTS", "OSDSUPPORT", "WIRED", "WHQL",
+    "KVMCONCONSOLE", "KVMIPCONTROL", "KVMPCVIDEO",
+    "OSDSUPPORT", "WIRED", "WHQL",
     "DRIVECAPACITY", "POE_YN", "WDM_YN", "DUPEMODES", "MAXUSERS", "ERASE_MODES",
     "Package Height", "Package Length", "Package Width", "Product Height", "Product Length", "Product Width",
     "Shipping (Package) Weight", "Weight of Product", "Category", "Sub Category", "Displays"
@@ -402,7 +388,6 @@ column_map = {
     "KVMCONCONSOLE": "Console Interface",
     "KVMIPCONTROL": "IP Control",
     "KVMPCVIDEO": "PC Video Type",
-    "KVMPORTS": "KVM Host Ports",
     "OSDSUPPORT": "On-Screen Display",
     "WIRED": "Wiring Standard",
     "WHQL": "Microsoft WHQL Certified",
@@ -425,19 +410,37 @@ column_map = {
 }
 
 def clean_value(val, field=None):
-    if pd.isnull(val): return None
+    if pd.isnull(val):
+        return None
     if field == "PACKQTY" and isinstance(val, str) and val.strip() == "1, 1":
         return 1
     try:
         f = float(val)
         return int(f) if f.is_integer() else f
     except (ValueError, TypeError):
-        return str(val).strip()
+        pass
+    s = str(val).strip()
+    m = re.search(r'[-+]?\d{1,3}(?:,\d{3})*(?:\.\d+)?|[-+]?\d+(?:\.\d+)?', s)
+    if m:
+        try:
+            num = float(m.group(0).replace(',', ''))
+            if field == "CABLELENGTH":
+                if re.search(r'\b(m|meter|meters|metre|metres)\b', s, flags=re.I):
+                    num = num * 1000.0
+                elif re.search(r'\b(in|inch|inches)\b', s, flags=re.I):
+                    num = num * 25.4
+                elif re.search(r'\b(ft|foot|feet)\b', s, flags=re.I):
+                    num = num * 304.8
+                elif re.search(r'\b(cm|centimeter|centimetre|centimeters|centimetres)\b', s, flags=re.I):
+                    num = num * 10.0
+            return int(num) if float(num).is_integer() else float(num)
+        except Exception:
+            pass
+    return s
 
 def normalize_product_number(pn):
     return pn.strip().upper() if isinstance(pn, str) else pn
 
-# --- Pretty format helpers (render only) ---
 def _fmt_num(n, decimals=1):
     s = f"{n:.{decimals}f}"
     return s[:-2] if s.endswith(".0") else s
@@ -457,7 +460,6 @@ def _format_cable_length(mm_val):
         feet_str = _fmt_num(round(feet, 1), 1)
         return f"{feet_str}ft [{_fmt_num(round(meters, 1), 1)}m]"
 
-# NEW: pretty-format weights from grams
 def _format_weight_grams(g_val):
     try:
         g = float(g_val)
@@ -471,7 +473,6 @@ def _format_weight_grams(g_val):
         kg = g / 1000.0
         return f"{_fmt_num(lbs, 1)} lbs [{_fmt_num(kg, 1)} kg]"
 
-# ---- (Added) helpers so the drop-in parser compiles if used ----
 _LEN_UNIT = r'\b(?:ft|feet|foot|in(?:ch(?:es)?)?|cm|centimeter(?:s)?|centimetre(?:s)?|m|meter(?:s)?|metre(?:s)?)\b'
 
 def _to_mm(value: float, unit: str | None) -> float:
@@ -488,82 +489,60 @@ def _to_mm(value: float, unit: str | None) -> float:
         return value * 1000.0
     return value
 
-# ---- (Added) drop-in length filter parser ----
 def _parse_length_filter(prompt: str):
-    """
-    Return a Pinecone filter for cablelength using units in the user prompt.
-    Handles:
-      - "between 3 and 6 ft" / "from 1m to 2m"
-      - bare ranges: "3–6 ft", "3-6 ft"
-      - comparators: "< 8 ft", "under 2m", ">= 6 in", etc.
-    """
     s = prompt.lower()
-
-    # ---- BETWEEN / FROM ... (allows dash as the connector) ----
+    def to_mm(val, unit):
+        return _to_mm(float(val), unit)
+    lo = None
+    hi = None
     m = re.search(
-        rf'(?:between|from)\s*'
-        rf'(\d+(?:\.\d+)?)\s*({_LEN_UNIT})?\s*'
-        rf'(?:and|to|through|thru|[-–—])\s*'
-        rf'(\d+(?:\.\d+)?)\s*({_LEN_UNIT})?',
+        rf'(?:between|from)\s*(\d+(?:\.\d+)?)\s*({_LEN_UNIT})?\s*(?:and|to|through|thru|[-–—])\s*(\d+(?:\.\d+)?)\s*({_LEN_UNIT})?',
         s
     )
     if m:
-        a = float(m.group(1)); unit_a = m.group(2)
-        b = float(m.group(3)); unit_b = m.group(4)
-        unit = unit_a or unit_b
-        if not unit:
-            return None  # don't guess if neither side has a unit
-        lo = _to_mm(min(a, b), unit)
-        hi = _to_mm(max(a, b), unit)
-        return {"$gte": lo, "$lte": hi}
-
-    # ---- BARE RANGE: "7–10 ft", "0.5-1 m" (unit can be on either side) ----
+        a, ua, b, ub = float(m.group(1)), m.group(2), float(m.group(3)), m.group(4)
+        unit = ua or ub
+        if unit:
+            lo = to_mm(min(a,b), unit)
+            hi = to_mm(max(a,b), unit)
     m = re.search(
-        rf'(\d+(?:\.\d+)?)\s*({_LEN_UNIT})?\s*'
-        rf'(?:[-–—]|to|and)\s*'
-        rf'(\d+(?:\.\d+)?)\s*({_LEN_UNIT})?',
+        rf'(\d+(?:\.\d+)?)\s*({_LEN_UNIT})?\s*(?:[-–—]|to|and)\s*(\d+(?:\.\d+)?)\s*({_LEN_UNIT})?',
         s
     )
-    if m:
-        a = float(m.group(1)); unit_a = m.group(2)
-        b = float(m.group(3)); unit_b = m.group(4)
-        unit = unit_a or unit_b
-        if not unit:
-            return None
-        lo = _to_mm(min(a, b), unit)
-        hi = _to_mm(max(a, b), unit)
+    if m and not (lo is not None and hi is not None):
+        a, ua, b, ub = float(m.group(1)), m.group(2), float(m.group(3)), m.group(4)
+        unit = ua or ub
+        if unit:
+            lo = to_mm(min(a,b), unit)
+            hi = to_mm(max(a,b), unit)
+    for pat, kind in [
+        (rf'(?:>=|greater than or equal to|at\s*least|no\s*less\s*than|minimum of)\s*(\d+(?:\.\d+)?)\s*({_LEN_UNIT})', 'lo'),
+        (rf'(?:>|greater than|over|more than)\s*(\d+(?:\.\d+)?)\s*({_LEN_UNIT})', 'lo_open'),
+        (rf'(?:<=|less than or equal to|at\s*most|no more than|up to)\s*(\d+(?:\.\d+)?)\s*({_LEN_UNIT})', 'hi'),
+        (rf'(?:<|less than|under|below)\s*(\d+(?:\.\d+)?)\s*({_LEN_UNIT})', 'hi_open'),
+    ]:
+        for m in re.finditer(pat, s):
+            v = to_mm(m.group(1), m.group(2))
+            if kind.startswith('lo'):
+                lo = max(lo, v) if lo is not None else v
+            else:
+                hi = min(hi, v) if hi is not None else v
+    if lo is None and hi is None:
+        return None
+    if lo is not None and hi is not None and lo > hi:
+        return None
+    if lo is not None and hi is not None:
         return {"$gte": lo, "$lte": hi}
+    if lo is not None:
+        return {"$gte": lo}
+    return {"$lte": hi}
 
-    # ---- <= family ----
-    m = re.search(rf'(?:<=|less than or equal to|at\s*most|no more than|up to)\s*(\d+(?:\.\d+)?)\s*({_LEN_UNIT})', s)
-    if m:
-        return {"$lte": _to_mm(float(m.group(1)), m.group(2))}
-
-    # ---- < family ----
-    m = re.search(rf'(?:<|less than|under|below)\s*(\d+(?:\.\d+)?)\s*({_LEN_UNIT})', s)
-    if m:
-        return {"$lt": _to_mm(float(m.group(1)), m.group(2))}
-
-    # ---- >= family ----
-    m = re.search(rf'(?:>=|greater than or equal to|at\s*least|no less than|minimum of)\s*(\d+(?:\.\d+)?)\s*({_LEN_UNIT})', s)
-    if m:
-        return {"$gte": _to_mm(float(m.group(1)), m.group(2))}
-
-    # ---- > family ----
-    m = re.search(rf'(?:>|greater than|over|more than)\s*(\d+(?:\.\d+)?)\s*({_LEN_UNIT})', s)
-    if m:
-        return {"$gt": _to_mm(float(m.group(1)), m.group(2))}
-
-    return None
-
-# mm-based fields to pretty print
 _PRETTY_MM_FIELDS = {
     "CABLELENGTH",
     "Package Height", "Package Length", "Package Width",
     "Product Height", "Product Length", "Product Width",
 }
 
-# weight-based fields to pretty print
 _PRETTY_WEIGHT_FIELDS = {
     "Shipping (Package) Weight", "Weight of Product"
 }
@@ -585,34 +564,27 @@ def row_to_text(row):
 
 def build_metadata(row):
     meta = {"product_number": normalize_product_number(row["Product Number"])}
-
-    # numeric fields (store raw numeric for filtering)
+    # numeric fields
     for field in fields:
         if field == "Product Number": continue
         value = clean_value(row.get(field), field)
         if isinstance(value, (int, float)):
             meta[field.lower()] = value
-
     # categorical fields
     for meta_key in CATEGORICAL_FIELDS.keys():
         norm_col = f"_{meta_key}_norm"
         val = row.get(norm_col)
         if pd.notna(val):
             meta[meta_key] = val
-
-    # material tags for filtering
+    # material tags
     tags = row.get("_material_tags")
     if isinstance(tags, list) and tags:
         meta["material_tags"] = tags
         for t in tags:
             meta[f"mtag_{t}"] = True
-
     return meta
 
-# ---- Build & upload ----
 documents = [Document(page_content=row_to_text(row), metadata=build_metadata(row)) for _, row in df.iterrows()]
-
-# Normalize IDs to uppercase (consistent with sku_vocab + chatbot filters)
 uuids = [normalize_product_number(p) for p in df["Product Number"].tolist()]
 
 print(f"Beginning upload: {len(documents)} docs, batch size {BATCH_SIZE}")
@@ -624,7 +596,4 @@ for i in tqdm(range(0, len(documents), BATCH_SIZE), desc="Uploading to Pinecone"
         time.sleep(SLEEP_BETWEEN_BATCHES)
 
 print("Upload complete.")
-
 # The vector size from OpenAI’s text-embedding-3-large is 3072.
-# Your Pinecone index expects vectors of dimension 3072 by default in this script (or 1536 for 3-small).
-# Cosine similarity is a standard, recommended metric for text embeddings.
