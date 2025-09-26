@@ -187,8 +187,9 @@ _STOPWORDS = {
     "a","an","the","do","does","did","you","your","yours","have","has","had","any","that","this","these","those",
     "can","could","may","might","will","would","shall","should","more","most","then","than","of","for","to","in",
     "on","with","without","and","or","but","if","it","its","is","are","was","were","be","being","been","at","by",
-    "about","from","as","up","over","under","between"
+    "about","from","as","up","over","under","between", "other","others","detail","details"
 }
+
 
 def _lemma(tok: str) -> str:
     tok = tok.lower()
@@ -548,14 +549,21 @@ def find_number_near_keywords(prompt_norm: str, keywords: list[str]):
 
 # --- phrases that imply pivoting away from the current SKU
 _PIVOT_PHRASES = {
-    "another", "a different", "different one", "other", "else", "instead",
-    "similar", "like this but", "do you have", "looking for", "need a",
-    "not this", "without", "alternatives", "option", "options"
+    "another", "a different", "different one", "something else", "instead",
+    "similar to this but", "like this but", "do you have", "looking for",
+    "need a", "not this", "without", "alternative", "alternatives",
+    "other option", "other options", "different option", "different options",
+    "another option", "another one"
 }
 
 def _looks_like_new_product_query(p_norm: str) -> bool:
+    # don’t treat “any other details” (or similar) as a pivot
+    if re.search(r'\bother\s+detail(s)?\b', p_norm):
+        return False
+
     if any(phrase in p_norm for phrase in _PIVOT_PHRASES):
         return True
+
     has_domain = any(tok in p_norm for tok in _DOMAIN_SEEK_TOKENS)
     has_numbery = (
         bool(re.search(r'\d', p_norm)) or
@@ -566,9 +574,8 @@ def _looks_like_new_product_query(p_norm: str) -> bool:
     color_hit = any(norm_text(c) in p_norm for c in (categorical_values.get("color", []) or []))
     material_hit = any(norm_text(m) in p_norm for m in (categorical_values.get("material", []) or []))
     wireless_hit = "wireless" in p_norm or "wifi" in p_norm or "wi fi" in p_norm
-    if has_domain and (has_numbery or color_hit or material_hit or wireless_hit):
-        return True
-    return False
+    return bool(has_domain and (has_numbery or color_hit or material_hit or wireless_hit))
+
 
 def is_vague_follow_up(prompt):
     last_pn = st.session_state.get("last_product_number") or ""
