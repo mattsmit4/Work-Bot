@@ -58,18 +58,25 @@ install_keywords = [
     "update firmware", "how to use", "step by step", "steps"
 ]
 
-# MERGED: treat “kvm ports” as the canonical Ports field
+# Treat “kvm ports” as the canonical Ports field; add per-connector derived fields too
 metadata_field_keywords = {
     "ports": [
         "total ports","ports total","ports",
         "number of ports","num of ports","num ports",
         "port count","ports count",
-        "kvm ports","ports kvm"  # <— added
+        "kvm ports","ports kvm"
     ],
     "packqty": ["in the pack","in the package","package quantity","pack qty","in a pack","in a package"],
     "displays": ["displays","monitors","screens","number of displays"],
     "numharddrive": ["hard drive","hard drives"],
-    "cablelength": ["cable length","length of cable","cablelength","cord length"]
+    "cablelength": ["cable length","length of cable","cablelength","cord length"],
+
+    # NEW: per-connector numeric filters (populated by ingestion metadata)
+    "usb_c_ports": ["usb-c ports","usbc ports","usb c ports","type-c ports","type c ports"],
+    "usb_a_ports": ["usb-a ports","usb a ports","usb ports","type-a ports","type a ports"],
+    "hdmi_ports":  ["hdmi port","hdmi ports"],
+    "dp_ports":    ["displayport","display port","dp port","dp ports"],
+    "vga_ports":   ["vga port","vga ports"]
 }
 
 def _mtime(path:str)->float:
@@ -190,7 +197,6 @@ _STOPWORDS = {
     "about","from","as","up","over","under","between", "other","others","detail","details"
 }
 
-
 def _lemma(tok: str) -> str:
     tok = tok.lower()
     if len(tok) > 4 and tok.endswith("ies"):
@@ -299,7 +305,7 @@ def pick_categories_from_prompt(prompt_text: str):
         cat_hits = [c for c in cat_hits if "network" not in c]
         sub_hits = [s for s in sub_hits if "network" not in s]
 
-    # New: don't push generic "cable organizers/accessories" from a plain "cable" word
+    # strip organizer/accessory style subs
     generic_bad = ("organizer", "organisers", "fastener", "accessor")
     sub_hits = [s for s in sub_hits if not any(b in s for b in generic_bad)]
 
@@ -339,7 +345,6 @@ def build_subcategory_allowlist(sub_token: str, forbid: list[str]):
         if sub_token and sub_token in s:
             if not any(f in s for f in (forbid or [])):
                 allow.append(s)
-    # New: strip organizer/accessory style subs
     allow = [s for s in allow if not any(b in s for b in ("organizer", "organisers", "fastener", "accessor"))]
     return sorted(list(dict.fromkeys(allow)))
 
@@ -442,7 +447,6 @@ def _satisfies_numeric(meta: dict, flt: dict) -> bool:
                 return False
     return True
 
-# --- understands ≥ ≤ (and ≧ ≦)
 def parse_global_range(prompt_text: str):
     s = prompt_text.lower()
     s = s.replace("≧", "≥").replace("≦", "≤")
@@ -464,7 +468,7 @@ def parse_global_range(prompt_text: str):
         return {"$gte": lo, "$lte": hi}
     return None
 
-# === FIXED: length filter that accumulates BOTH bounds ===
+# === Length filter (single definition; accumulates BOTH bounds) ===
 def _parse_length_filter(prompt: str):
     s = prompt.lower()
     lo = None
@@ -497,7 +501,6 @@ def _parse_length_filter(prompt: str):
             hi = _to_mm(max(a, b), unit)
 
     # 3) accumulate single-sided bounds
-    #    NOTE: “more than / greater than” have negative lookbehind to avoid matching “no/not more than…”
     for pat, kind in [
         (rf'(?:<=|less than or equal to|at\s*most|no more than|up to)\s*(\d+(?:\.\d+)?)\s*({_LEN_UNIT})', 'hi'),
         (rf'(?:<|less than|under|below)\s*(\d+(?:\.\d+)?)\s*({_LEN_UNIT})', 'hi'),
@@ -520,7 +523,6 @@ def _parse_length_filter(prompt: str):
     if lo is not None:
         return {"$gte": lo}
     return {"$lte": hi}
-
 
 def find_number_near_keywords(prompt_norm: str, keywords: list[str]):
     for kw in keywords:
@@ -545,7 +547,6 @@ def find_number_near_keywords(prompt_norm: str, keywords: list[str]):
             return {"$eq": float(m.group(1))}
 
     return None
-
 
 # --- phrases that imply pivoting away from the current SKU
 _PIVOT_PHRASES = {
@@ -575,7 +576,6 @@ def _looks_like_new_product_query(p_norm: str) -> bool:
     material_hit = any(norm_text(m) in p_norm for m in (categorical_values.get("material", []) or []))
     wireless_hit = "wireless" in p_norm or "wifi" in p_norm or "wi fi" in p_norm
     return bool(has_domain and (has_numbery or color_hit or material_hit or wireless_hit))
-
 
 def is_vague_follow_up(prompt):
     last_pn = st.session_state.get("last_product_number") or ""
@@ -683,9 +683,7 @@ def extract_filter_from_prompt(prompt):
             else:
                 val = find_number_near_keywords(prompt_norm, keywords)
                 if val is not None:
-                    # val can now be {"$gte":3}, {"$lte":5}, or {"$eq":2}
                     filters[field] = val
-
 
     # --- SPECIAL: pack quantity from "two-pack", "3 pack", etc.
     m_pack = re.search(r'\b(\d+|' + "|".join(_NUM_WORDS.keys()) + r')\s*[- ]?pack\b', prompt_norm)
@@ -715,7 +713,7 @@ def extract_filter_from_prompt(prompt):
             filters[f"mtag_{t}"] = True
         filters.pop("material", None)
 
-    # --- SAFETY NET: remap 'kvmports' → 'ports' and merge bounds
+    # SAFETY NET: remap 'kvmports' -> 'ports'
     if "kvmports" in filters:
         cond = filters.pop("kvmports")
         if "ports" in filters and isinstance(filters["ports"], dict) and isinstance(cond, dict):
@@ -723,13 +721,12 @@ def extract_filter_from_prompt(prompt):
         else:
             filters["ports"] = cond
 
-    # === New cable bias: if prompt says "cable" and we have a length filter, prefer real cable categories ===
+    # If the prompt says "cable" and we have a length filter, bias to cable categories
     if ("cablelength" in filters) and ("cable" in prompt_norm):
         cable_cats = [norm_text(v) for v in (categorical_values.get("category") or []) if v and "cable" in v.lower()]
         cable_cats = [c for c in cable_cats if not any(bad in c for bad in ("organizer","organiser","fastener","accessor"))]
         if cable_cats:
             filters["category"] = {"$in": cable_cats}
-            # drop misleading subcategories if they look like organizers/accessories
             if "subcategory" in filters and isinstance(filters["subcategory"], dict) and "$in" in filters["subcategory"]:
                 filters["subcategory"]["$in"] = [
                     s for s in filters["subcategory"]["$in"]
@@ -768,6 +765,7 @@ def render_conversational_answer(prompt_text:str)->str:
             "Answer the user’s question directly using the spec. "
             "If a quick list helps, you may include up to 3–5 short bullets, but only when the user asked for 'specs', 'what’s included', or similar. "
             "If 'Included in Package' exists AND the user asks what's in the box, summarize it inline as 'In the box: ...'. "
+            "When users ask about ports/connectors, read from **Connector Type**, **External Ports**, or **Host Connectors** verbatim from the spec. "
             "Avoid emojis. End with a short offer to check another detail if needed."
         )]
         + [SystemMessage(f"SPECIFICATION:\n{st.session_state.last_context}")]
@@ -964,7 +962,9 @@ if prompt:
             interesting_keys = (
                 "category", "subcategory", "material", "material_tags",
                 "fiberduplex", "fibertype", "ports", "displays", "color", "cablelength", "wireless",
-                "interface", "mounting_options"
+                "interface", "mounting_options",
+                # per-connector derived fields:
+                "usb_c_ports", "usb_a_ports", "hdmi_ports", "dp_ports", "vga_ports"
             )
             print("Resolved Metadata (top doc):")
             for k in interesting_keys:
@@ -1015,7 +1015,8 @@ if prompt:
     interesting_keys = (
         "category", "subcategory", "material", "material_tags",
         "fiberduplex", "fibertype", "ports", "displays", "color", "cablelength", "wireless",
-        "interface", "mounting_options"
+        "interface", "mounting_options",
+        "usb_c_ports", "usb_a_ports", "hdmi_ports", "dp_ports", "vga_ports"
     )
     print("Resolved Metadata (top doc):")
     for k in interesting_keys:

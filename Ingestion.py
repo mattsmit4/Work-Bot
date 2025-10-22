@@ -110,6 +110,9 @@ if not os.path.exists(DATA_XLSX_PATH):
 print(f"Loading data from: {DATA_XLSX_PATH}")
 df = pd.read_excel(DATA_XLSX_PATH)
 
+# Normalize headers so trailing spaces / weird casing don't break lookups
+df.rename(columns=lambda c: str(c).strip(), inplace=True)
+
 # Ensure valid IDs (recommended)
 if "Product Number" not in df.columns:
     raise KeyError("The Excel file is missing the required 'Product Number' column.")
@@ -409,9 +412,20 @@ column_map = {
     "Sub Category": "Product Subcategory"
 }
 
+# === Keep these fields as raw text (don’t numeric-parse) ===
+TEXT_ONLY_FIELDS = {
+    "CONNTYPE", "EXTERNALPORTS", "HOSTCONNECTOR",
+    "INTERFACEA", "INTERFACEB", "ZCONTENTITEM"
+}
+
 def clean_value(val, field=None):
     if pd.isnull(val):
         return None
+
+    # Keep rich text for connector/package fields
+    if field and field.upper() in TEXT_ONLY_FIELDS:
+        return str(val).strip()
+
     if field == "PACKQTY" and isinstance(val, str) and val.strip() == "1, 1":
         return 1
     try:
@@ -473,70 +487,6 @@ def _format_weight_grams(g_val):
         kg = g / 1000.0
         return f"{_fmt_num(lbs, 1)} lbs [{_fmt_num(kg, 1)} kg]"
 
-_LEN_UNIT = r'\b(?:ft|feet|foot|in(?:ch(?:es)?)?|cm|centimeter(?:s)?|centimetre(?:s)?|m|meter(?:s)?|metre(?:s)?)\b'
-
-def _to_mm(value: float, unit: str | None) -> float:
-    if not unit:
-        unit = "ft"
-    unit = unit.lower()
-    if unit in ("ft", "feet", "foot"):
-        return value * 304.8
-    if unit in ("in", "inch", "inches"):
-        return value * 25.4
-    if unit in ("cm", "centimeter", "centimeters", "centimetre", "centimetres"):
-        return value * 10.0
-    if unit in ("m", "meter", "meters", "metre", "metres"):
-        return value * 1000.0
-    return value
-
-def _parse_length_filter(prompt: str):
-    s = prompt.lower()
-    def to_mm(val, unit):
-        return _to_mm(float(val), unit)
-    lo = None
-    hi = None
-    m = re.search(
-        rf'(?:between|from)\s*(\d+(?:\.\d+)?)\s*({_LEN_UNIT})?\s*(?:and|to|through|thru|[-–—])\s*(\d+(?:\.\d+)?)\s*({_LEN_UNIT})?',
-        s
-    )
-    if m:
-        a, ua, b, ub = float(m.group(1)), m.group(2), float(m.group(3)), m.group(4)
-        unit = ua or ub
-        if unit:
-            lo = to_mm(min(a,b), unit)
-            hi = to_mm(max(a,b), unit)
-    m = re.search(
-        rf'(\d+(?:\.\d+)?)\s*({_LEN_UNIT})?\s*(?:[-–—]|to|and)\s*(\d+(?:\.\d+)?)\s*({_LEN_UNIT})?',
-        s
-    )
-    if m and not (lo is not None and hi is not None):
-        a, ua, b, ub = float(m.group(1)), m.group(2), float(m.group(3)), m.group(4)
-        unit = ua or ub
-        if unit:
-            lo = to_mm(min(a,b), unit)
-            hi = to_mm(max(a,b), unit)
-    for pat, kind in [
-        (rf'(?:>=|greater than or equal to|at\s*least|no\s*less\s*than|minimum of)\s*(\d+(?:\.\d+)?)\s*({_LEN_UNIT})', 'lo'),
-        (rf'(?:>|greater than|over|more than)\s*(\d+(?:\.\d+)?)\s*({_LEN_UNIT})', 'lo_open'),
-        (rf'(?:<=|less than or equal to|at\s*most|no more than|up to)\s*(\d+(?:\.\d+)?)\s*({_LEN_UNIT})', 'hi'),
-        (rf'(?:<|less than|under|below)\s*(\d+(?:\.\d+)?)\s*({_LEN_UNIT})', 'hi_open'),
-    ]:
-        for m in re.finditer(pat, s):
-            v = to_mm(m.group(1), m.group(2))
-            if kind.startswith('lo'):
-                lo = max(lo, v) if lo is not None else v
-            else:
-                hi = min(hi, v) if hi is not None else v
-    if lo is None and hi is None:
-        return None
-    if lo is not None and hi is not None and lo > hi:
-        return None
-    if lo is not None and hi is not None:
-        return {"$gte": lo, "$lte": hi}
-    if lo is not None:
-        return {"$gte": lo}
-    return {"$lte": hi}
-
 _PRETTY_MM_FIELDS = {
     "CABLELENGTH",
     "Package Height", "Package Length", "Package Width",
@@ -562,6 +512,42 @@ def row_to_text(row):
                 lines.append(f"{label}: {value}")
     return "\n".join(lines).strip()
 
+# === Generalized port counting (USB-C, USB-A, HDMI, DP, VGA) ===
+PORT_PATTERNS = {
+    "usb_c_ports": re.compile(r'\b(usb[\s\-]?c|type[\s\-]?c)\b', re.I),
+    "usb_a_ports": re.compile(r'\b(usb[\s\-]?a|type[\s\-]?a)\b', re.I),
+    "hdmi_ports":  re.compile(r'\bhdmi\b', re.I),
+    "dp_ports":    re.compile(r'\b(display\s*port|displayport|\bdp\b)\b', re.I),
+    "vga_ports":   re.compile(r'\bvga\b', re.I),
+}
+
+MULT_PATTERNS = [
+    re.compile(r'\(\s*x\s*(\d+)\s*\)', re.I),   # (x2)
+    re.compile(r'×\s*(\d+)', re.I),             # ×2 (unicode)
+    re.compile(r'\b(\d+)\s*x\b', re.I),         # 2x
+]
+
+def count_ports(text: str, port_regex: re.Pattern) -> int | None:
+    if not isinstance(text, str) or not text.strip():
+        return None
+    total = 0
+    for seg in re.split(r'[;,\n]|\/', text):
+        if not port_regex.search(seg):
+            continue
+        # explicit multiplier
+        mult = 0
+        for pat in MULT_PATTERNS:
+            m = pat.search(seg)
+            if m:
+                mult = max(mult, int(m.group(1)))
+        if mult:
+            total += mult
+            continue
+        # fallback: "2 HDMI" or "HDMI 2" or "USB-C ports 3"
+        m = re.search(r'(\d+)\s*(?:ports?|x)?\b', seg, re.I)
+        total += int(m.group(1)) if m else 1
+    return total or None
+
 def build_metadata(row):
     meta = {"product_number": normalize_product_number(row["Product Number"])}
     # numeric fields
@@ -582,6 +568,16 @@ def build_metadata(row):
         meta["material_tags"] = tags
         for t in tags:
             meta[f"mtag_{t}"] = True
+    # derived: per-connector port counts from multiple text columns
+    text_sources = [row.get("CONNTYPE"), row.get("EXTERNALPORTS"), row.get("HOSTCONNECTOR")]
+    for key, rx in PORT_PATTERNS.items():
+        best = 0
+        for src in text_sources:
+            c = count_ports(src, rx) if isinstance(src, str) else None
+            if c:
+                best = max(best, c)
+        if best:
+            meta[key] = float(best)
     return meta
 
 documents = [Document(page_content=row_to_text(row), metadata=build_metadata(row)) for _, row in df.iterrows()]
