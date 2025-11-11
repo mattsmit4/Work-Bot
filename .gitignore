@@ -1,17 +1,20 @@
-# --- Secrets ---
+# Environment
 .env
+.env.local
 
-# --- Local data (Excel, CSV, etc.) ---
+# Data files
+*.csv
 *.xlsx
-documents/*.xlsx
+*.xls
 
-# --- Python cache / temp ---
+# Python
 __pycache__/
 *.pyc
+*.pyo
 
-# --- Virtual environment ---
-.venv/
+# VS Code
+.devcontainer/
+.vscode/
 
-# --- OS/editor junk ---
-.DS_Store
-Thumbs.db
+# Logs
+*.log

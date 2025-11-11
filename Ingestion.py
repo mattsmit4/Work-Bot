@@ -11,6 +11,9 @@ from langchain_openai import OpenAIEmbeddings
 from langchain_core.documents import Document
 from tqdm import tqdm
 
+# --- NEW: retry helpers for stable upserts (Fix #1)
+from tenacity import retry, stop_after_attempt, wait_exponential
+
 load_dotenv()
 
 # ---- env helpers (consistent, safe) ----
@@ -66,8 +69,14 @@ SLEEP_BETWEEN_BATCHES = env_optional_float("SLEEP_BETWEEN_BATCHES", 0.0)  # seco
 # ---- Pinecone setup ----
 pc = Pinecone(api_key=PINECONE_API_KEY)
 
-existing_indexes = [idx["name"] for idx in pc.list_indexes()]
-if INDEX_NAME not in existing_indexes:
+# --- UPDATED: safer index existence/describe handling (Fix #4)
+existing = []
+try:
+    existing = [getattr(idx, "name", idx.get("name")) for idx in (pc.list_indexes() or [])]
+except Exception:
+    pass
+
+if INDEX_NAME not in existing:
     print(f"Creating Pinecone index '{INDEX_NAME}' (dim={EMBED_DIM}, metric=cosine, {PINECONE_CLOUD}/{PINECONE_REGION})...")
     pc.create_index(
         name=INDEX_NAME,
@@ -75,25 +84,30 @@ if INDEX_NAME not in existing_indexes:
         metric="cosine",
         spec=ServerlessSpec(cloud=PINECONE_CLOUD, region=PINECONE_REGION),
     )
-    while not pc.describe_index(INDEX_NAME).status["ready"]:
+    # wait until ready
+    while True:
+        try:
+            desc = pc.describe_index(INDEX_NAME)
+            status = getattr(desc, "status", None) or desc.get("status", {})
+            if status.get("ready"):
+                break
+        except Exception:
+            pass
         time.sleep(1)
 else:
     desc = pc.describe_index(INDEX_NAME)
-    serverless = desc.get("spec", {}).get("serverless", {})
-    dim = desc.get("dimension")
-    metric = desc.get("metric")
+    dim = getattr(desc, "dimension", desc.get("dimension"))
+    metric = getattr(desc, "metric", desc.get("metric"))
     if dim is not None and int(dim) != EMBED_DIM:
         raise RuntimeError(
             f"Pinecone index '{INDEX_NAME}' dimension={dim} != expected EMBED_DIM={EMBED_DIM}. "
             f"Either set EMBED_DIM to {dim}, switch EMBED_MODEL accordingly, or recreate the index."
         )
-    if metric and metric.lower() != "cosine":
+    if metric and str(metric).lower() != "cosine":
         raise RuntimeError(
             f"Pinecone index '{INDEX_NAME}' metric={metric} but this script expects 'cosine'. "
             "Recreate the index with metric='cosine' or adjust your code."
         )
-    if serverless:
-        print(f"Using existing Pinecone index '{INDEX_NAME}' ({serverless.get('cloud')}/{serverless.get('region')}), dim={dim}, metric={metric}")
 
 index = pc.Index(INDEX_NAME)
 
@@ -412,10 +426,16 @@ column_map = {
     "Sub Category": "Product Subcategory"
 }
 
-# === Keep these fields as raw text (don’t numeric-parse) ===
+# === Keep these fields as raw text (don’t numeric-parse)
 TEXT_ONLY_FIELDS = {
     "CONNTYPE", "EXTERNALPORTS", "HOSTCONNECTOR",
     "INTERFACEA", "INTERFACEB", "ZCONTENTITEM"
+}
+
+# --- NEW: only numeric-parse an allowlist (Fix #2)
+NUMERIC_ONLY_FIELDS = {
+    "CABLELENGTH","Ports","Displays","PACKQTY","POWERCONSUMPTION","OUTPUTVOLTS","INPUTAMPS","INPUTVOLTS",
+    "OUTPUTAMP","MAXDISPLAYSIZE","MINDISPLAYSIZE","UHEIGHT","DRIVECAPACITY","MAXUSERS","MTBF"
 }
 
 def clean_value(val, field=None):
@@ -426,14 +446,21 @@ def clean_value(val, field=None):
     if field and field.upper() in TEXT_ONLY_FIELDS:
         return str(val).strip()
 
+    s = str(val).strip()
+
+    # Only numeric-parse fields we explicitly care about as numbers
+    if field not in NUMERIC_ONLY_FIELDS:
+        return s
+
     if field == "PACKQTY" and isinstance(val, str) and val.strip() == "1, 1":
         return 1
+    # Try pure numeric
     try:
         f = float(val)
         return int(f) if f.is_integer() else f
     except (ValueError, TypeError):
         pass
-    s = str(val).strip()
+    # Extract first numeric token + unit handling for cable length
     m = re.search(r'[-+]?\d{1,3}(?:,\d{3})*(?:\.\d+)?|[-+]?\d+(?:\.\d+)?', s)
     if m:
         try:
@@ -512,7 +539,7 @@ def row_to_text(row):
                 lines.append(f"{label}: {value}")
     return "\n".join(lines).strip()
 
-# === Generalized port counting (USB-C, USB-A, HDMI, DP, VGA) ===
+# === Generalized port counting (USB-C, USB-A, HDMI, DP, VGA)
 PORT_PATTERNS = {
     "usb_c_ports": re.compile(r'\b(usb[\s\-]?c|type[\s\-]?c)\b', re.I),
     "usb_a_ports": re.compile(r'\b(usb[\s\-]?a|type[\s\-]?a)\b', re.I),
@@ -527,6 +554,9 @@ MULT_PATTERNS = [
     re.compile(r'\b(\d+)\s*x\b', re.I),         # 2x
 ]
 
+# --- NEW: support prefix multipliers like "4x USB-C" (Fix #5)
+PREFIX_MULT = re.compile(r'\b(\d+)\s*(?:x|×)\s*', re.I)
+
 def count_ports(text: str, port_regex: re.Pattern) -> int | None:
     if not isinstance(text, str) or not text.strip():
         return None
@@ -534,7 +564,12 @@ def count_ports(text: str, port_regex: re.Pattern) -> int | None:
     for seg in re.split(r'[;,\n]|\/', text):
         if not port_regex.search(seg):
             continue
-        # explicit multiplier
+        # prefix "3x USB-C"
+        m0 = PREFIX_MULT.search(seg)
+        if m0:
+            total += int(m0.group(1))
+            continue
+        # explicit multiplier in trailing form
         mult = 0
         for pat in MULT_PATTERNS:
             m = pat.search(seg)
@@ -583,11 +618,26 @@ def build_metadata(row):
 documents = [Document(page_content=row_to_text(row), metadata=build_metadata(row)) for _, row in df.iterrows()]
 uuids = [normalize_product_number(p) for p in df["Product Number"].tolist()]
 
-print(f"Beginning upload: {len(documents)} docs, batch size {BATCH_SIZE}")
-for i in tqdm(range(0, len(documents), BATCH_SIZE), desc="Uploading to Pinecone"):
-    batch_docs = documents[i:i + BATCH_SIZE]
-    batch_ids  = uuids[i:i + BATCH_SIZE]
+# --- NEW: quick sanity warnings if key metadata missing (Fix #3)
+REQUIRED_META = ["product_number","ports","displays","cablelength","usb_c_ports","usb_a_ports","hdmi_ports","dp_ports","vga_ports"]
+if documents:
+    sample_meta = documents[0].metadata or {}
+    for k in REQUIRED_META:
+        if k not in sample_meta:
+            print(f"[WARN] metadata key '{k}' may be missing in ingestion output")
+
+# --- UPDATED: idempotent, retried upserts with tighter batches (Fix #1)
+effective_batch = min(BATCH_SIZE, 64)
+
+@retry(stop=stop_after_attempt(5), wait=wait_exponential(multiplier=1, max=30))
+def _add_docs(batch_docs, batch_ids):
+    # PineconeVectorStore.add_documents with ids performs upsert semantics
     vector_store.add_documents(documents=batch_docs, ids=batch_ids)
+
+print(f"Beginning upload: {len(documents)} docs, batch size {effective_batch}")
+for i in tqdm(range(0, len(documents), effective_batch), desc="Uploading to Pinecone"):
+    j = i + effective_batch
+    _add_docs(documents[i:j], uuids[i:j])
     if SLEEP_BETWEEN_BATCHES > 0:
         time.sleep(SLEEP_BETWEEN_BATCHES)
 

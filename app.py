@@ -1,5 +1,6 @@
 import streamlit as st
-import os, json, re, string
+import os, json, re, string, csv
+from datetime import datetime
 from dotenv import load_dotenv
 
 from pinecone import Pinecone
@@ -38,6 +39,41 @@ CHAT_MODEL = env_optional("OPENAI_CHAT_MODEL", "gpt-4o")
 TEMP = float(env_optional("OPENAI_TEMPERATURE", "0.7"))
 EMBED_MODEL = env_optional("EMBED_MODEL", "text-embedding-3-large")
 
+# -------------------- NEW: Conversation Logging Function --------------------
+def log_to_csv(user_message, bot_response):
+    """Save conversation to a simple CSV file"""
+    try:
+        # Check if file exists to know if we need headers
+        file_exists = os.path.exists('conversations.csv')
+        
+        with open('conversations.csv', 'a', newline='', encoding='utf-8') as f:
+            writer = csv.writer(f)
+            
+            # Write headers if new file
+            if not file_exists:
+                writer.writerow([
+                    'Timestamp',
+                    'User Message',
+                    'Bot Response',
+                    'Product Number',
+                    'Category',
+                    'Subcategory',
+                    'Similarity Score'
+                ])
+            
+            # Write the conversation
+            writer.writerow([
+                datetime.now().strftime('%Y-%m-%d %H:%M:%S'),
+                user_message,
+                bot_response,
+                st.session_state.get('last_product_number', ''),
+                st.session_state.get('last_metadata', {}).get('category', ''),
+                st.session_state.get('last_metadata', {}).get('subcategory', ''),
+                st.session_state.get('last_score', '')
+            ])
+    except Exception as e:
+        print(f"Error logging conversation: {e}")
+
 # -------------------- keywords --------------------
 fallback_keywords = [
     "what color","what colours","what colour","what type","what kind","how big","how small","how long",
@@ -45,11 +81,11 @@ fallback_keywords = [
     "is it","is it compatible","are they","specs","details","specifications","tech specs","technical details",
     "what ports","which ports","what connectors","which connectors","what inputs","what outputs",
     "how fast","what speed","what resolution","is this compatible","is this supported","will this work","tell me more",
-    "can i use this","can it","is there","do they","what’s included","what is included","what do you get",
-    "included accessories","in the box","what’s in the box","what comes with","do i need","will it help",
+    "can i use this","can it","is there","do they","what's included","what is included","what do you get",
+    "included accessories","in the box","what's in the box","what comes with","do i need","will it help",
     "does it require","will it fit","will it keep","what version","any differences","any difference","difference between"
 ]
-farewell_keywords = ["thank you","thanks","appreciate it","cheers","bye","goodbye","see you","you’ve been helpful","you have been helpful","that’s all","that is all","cool"]
+farewell_keywords = ["thank you","thanks","appreciate it","cheers","bye","goodbye","see you","you've been helpful","you have been helpful","that's all","that is all","cool"]
 
 install_keywords = [
     "install", "installation", "set up", "setup", "configure", "configuration",
@@ -58,7 +94,7 @@ install_keywords = [
     "update firmware", "how to use", "step by step", "steps"
 ]
 
-# Treat “kvm ports” as the canonical Ports field; add per-connector derived fields too
+# Treat "kvm ports" as the canonical Ports field; add per-connector derived fields too
 metadata_field_keywords = {
     "ports": [
         "total ports","ports total","ports",
@@ -91,8 +127,7 @@ def load_vector_store(index_name:str, embed_model:str, pinecone_key:str, openai_
 
 @st.cache_resource
 def load_llm(chat_model:str, temperature:float, openai_key:str):
-    os.environ["OPENAI_API_KEY"] = openai_key
-    return ChatOpenAI(model=chat_model, temperature=temperature)
+    return ChatOpenAI(model=chat_model, temperature=temperature, api_key=openai_key)
 
 @st.cache_resource
 def load_categorical_values(mtime:float):
@@ -487,7 +522,7 @@ def _parse_length_filter(prompt: str):
             lo = _to_mm(min(a, b), unit)
             hi = _to_mm(max(a, b), unit)
 
-    # 2) “A to B” style
+    # 2) "A to B" style
     m = re.search(
         rf'(\d+(?:\.\d+)?)\s*({_LEN_UNIT})?\s*(?:[-–—]|to|and)\s*(\d+(?:\.\d+)?)\s*({_LEN_UNIT})?',
         s
@@ -557,8 +592,20 @@ _PIVOT_PHRASES = {
     "another option", "another one"
 }
 
+# ====== NEW: clarification phrases to prevent false pivots ======
+_CLARIFY_PHRASES = {
+    "are you sure", "does it have", "do it have", "how many",
+    "only one", "just one", "is it two", "is it 2", "not two", "not 2",
+    "confirm", "double check", "double-check"
+}
+_PRONOUN_HINTS = {"it", "this", "that"}
+
 def _looks_like_new_product_query(p_norm: str) -> bool:
-    # don’t treat “any other details” (or similar) as a pivot
+    # clarification questions like "are you sure", "how many" shouldn't force a pivot
+    if any(ph in p_norm for ph in _CLARIFY_PHRASES):
+        return False
+
+    # don't treat "any other details" (or similar) as a pivot
     if re.search(r'\bother\s+detail(s)?\b', p_norm):
         return False
 
@@ -606,13 +653,21 @@ def is_vague_follow_up(prompt):
     clean = pn
     return len(clean.split()) <= 6 or any(k in clean for k in fallback_keywords)
 
-def is_farewell(prompt):
+# ====== NEW: explicit clarification follow-up detector ======
+def is_clarifying_followup(prompt: str) -> bool:
+    """
+    If we're already on a SKU and the user is questioning counts/specs
+    with pronouns ("it/this/that") or clarify phrases, treat as follow-up,
+    even if numbers are present.
+    """
+    if not st.session_state.get("last_product_number"):
+        return False
     p = norm_text(prompt)
-    return any(k in p for k in farewell_keywords)
-
-def is_install_request(prompt):
-    p = norm_text(prompt)
-    return any(k in p for k in install_keywords)
+    if any(ph in p for ph in _CLARIFY_PHRASES) or any(w in p.split() for w in _PRONOUN_HINTS):
+        if not extract_product_number(prompt):          # no new SKU
+            if not _looks_like_new_product_query(p):    # not a true pivot
+                return True
+    return False
 
 def _hydrate_product_from_prompt(prompt: str) -> str | None:
     pnums = extract_product_numbers(prompt)
@@ -627,6 +682,44 @@ def _hydrate_product_from_prompt(prompt: str) -> str | None:
         st.session_state.last_metadata = docs[0].metadata or {}
         return pn
     return None
+
+# ====== NEW: explicit per-connector count extraction ======
+_EXPL_PORT_PATTERNS = {
+    "usb_c_ports": r"(?:usb[\s\-]?c|type[\s\-]?c)",
+    "usb_a_ports": r"(?:usb[\s\-]?a|type[\s\-]?a|usb(?!\s*[\-]?c))",
+    "hdmi_ports":  r"(?:hdmi)",
+    "dp_ports":    r"(?:display\s*port|displayport|\bdp\b)",
+    "vga_ports":   r"(?:vga)"
+}
+
+def _extract_explicit_port_counts(prompt: str) -> dict:
+    """
+    Returns dict like {"usb_c_ports": {"$eq": 4}, "hdmi_ports": {"$eq": 2}}
+    when the prompt contains explicit counts near a connector term.
+    Handles "4x usb-c", "usb-c x4", "2 hdmi", "hdmi 2", etc.
+    """
+    s = prompt.lower()
+    out = {}
+
+    for key, term in _EXPL_PORT_PATTERNS.items():
+        # 4x usb-c  |  usb-c x4  |  2 usb-c  |  usb-c 2
+        pats = [
+            rf"\b(\d+)\s*[x×]\s*(?:{term})\b",
+            rf"\b(?:{term})\s*[x×]\s*(\d+)\b",
+            rf"\b(\d+)\s*(?:{term})\b",
+            rf"\b(?:{term})\s*(\d+)\b",
+        ]
+        best = None
+        for p in pats:
+            m = re.search(p, s, flags=re.I)
+            if m:
+                try:
+                    best = max(int(m.group(1)), best or 0)
+                except:
+                    pass
+        if best:
+            out[key] = {"$eq": float(best)}
+    return out
 
 def extract_filter_from_prompt(prompt):
     prompt_norm = norm_text(prompt)
@@ -672,18 +765,28 @@ def extract_filter_from_prompt(prompt):
         if "subcategory" not in filters and "subcategory" in multi_cat:
             filters["subcategory"] = multi_cat["subcategory"]
 
-    # --- numeric fields (global)
+    # === NEW: explicit connector counts (take precedence)
+    explicit_counts = _extract_explicit_port_counts(prompt)
+    if explicit_counts:
+        for k, v in explicit_counts.items():
+            filters[k] = v
+
+    # --- numeric fields (global / near-keyword)
     rng_any = parse_global_range(prompt)
     for field, keywords in metadata_field_keywords.items():
         if field == "cablelength":
             continue
+        # skip if we already set an explicit count for this field
+        if field in filters:
+            continue
+
         if any(kw in prompt_norm for kw in keywords):
-            if rng_any:
+            # try near-number first (e.g., "2 HDMI")
+            val = find_number_near_keywords(prompt_norm, keywords)
+            if val is not None:
+                filters[field] = val
+            elif rng_any:
                 filters[field] = rng_any
-            else:
-                val = find_number_near_keywords(prompt_norm, keywords)
-                if val is not None:
-                    filters[field] = val
 
     # --- SPECIAL: pack quantity from "two-pack", "3 pack", etc.
     m_pack = re.search(r'\b(\d+|' + "|".join(_NUM_WORDS.keys()) + r')\s*[- ]?pack\b', prompt_norm)
@@ -741,6 +844,17 @@ def show_response(reply):
     with st.chat_message("assistant"):
         st.markdown(reply)
     st.session_state.messages.append(AIMessage(reply))
+    
+    # NEW: Log the conversation
+    # Get the last user message
+    last_user_msg = ""
+    for msg in reversed(st.session_state.messages[:-1]):
+        if isinstance(msg, HumanMessage):
+            last_user_msg = msg.content
+            break
+    
+    if last_user_msg:
+        log_to_csv(last_user_msg, reply)
 
 def render_conversational_answer(prompt_text:str)->str:
     pn = st.session_state.last_product_number or "(unknown)"
@@ -756,14 +870,14 @@ def render_conversational_answer(prompt_text:str)->str:
             f"CONTENT SAFETY: Answer ONLY about the single StarTech.com product number {pn}. "
             "Do not mention, invent, or guess other product numbers or product names. "
             "Use ONLY facts present in the SPECIFICATION block below; if a fact is missing, say: "
-            "'That detail isn’t in the spec I have.'"
+            "'That detail isn't in the spec I have.'"
         )]
         + [SystemMessage(
             "STYLE: Be conversational and concise like a knowledgeable product specialist. "
             "No section headings or tables. Prefer 3–6 sentences. "
             "Start with: 'For <PRODUCT NUMBER>:' once, then explain. "
-            "Answer the user’s question directly using the spec. "
-            "If a quick list helps, you may include up to 3–5 short bullets, but only when the user asked for 'specs', 'what’s included', or similar. "
+            "Answer the user's question directly using the spec. "
+            "If a quick list helps, you may include up to 3–5 short bullets, but only when the user asked for 'specs', 'what's included', or similar. "
             "If 'Included in Package' exists AND the user asks what's in the box, summarize it inline as 'In the box: ...'. "
             "When users ask about ports/connectors, read from **Connector Type**, **External Ports**, or **Host Connectors** verbatim from the spec. "
             "Avoid emojis. End with a short offer to check another detail if needed."
@@ -780,7 +894,7 @@ def handle_greeting(prompt):
     greeting_keywords = ["hello","hi","hey","good morning","good afternoon","good evening"]
     wc = len(prompt.strip().split())
     if not st.session_state.greeted_user and wc <= 4 and any(re.search(rf"\b{g}\b", prompt.lower()) for g in greeting_keywords):
-        show_response("Hi there! I’m here to help you find the right StarTech.com product. Tell me what you’re trying to do or ask about a specific product number.")
+        show_response("Hi there! I'm here to help you find the right StarTech.com product. Tell me what you're trying to do or ask about a specific product number.")
         st.session_state.greeted_user = True
         return True
     return False
@@ -790,6 +904,14 @@ def handle_farewell(prompt):
         show_response("Thanks for chatting! If you need anything else about StarTech.com products, just ask.")
         return True
     return False
+
+def is_farewell(prompt):
+    p = norm_text(prompt)
+    return any(k in p for k in farewell_keywords)
+
+def is_install_request(prompt):
+    p = norm_text(prompt)
+    return any(k in p for k in install_keywords)
 
 def handle_install_block(prompt):
     if is_install_request(prompt):
@@ -888,7 +1010,7 @@ def handle_descriptive_query(prompt, f_override=None):
         for d, s in results:
             if _satisfies_numeric(d.metadata or {}, f):
                 return use_top_result([(d, s)])
-        show_response("I couldn’t find a product that meets that requirement. If you can adjust it, I’ll try again.")
+        show_response("I couldn't find a product that meets that requirement. If you can adjust it, I'll try again.")
         return "no-match"
 
     return use_top_result(results)
@@ -907,7 +1029,7 @@ if "messages" not in st.session_state:
         "You are a StarTech.com assistant. Always be friendly and professional. "
         "You only answer questions about StarTech.com products using the provided context. "
         "Do not mention or recommend products from any other company, supplier, or brand — only StarTech.com. "
-        "Do not make up information. If you’re unsure, ask for clarification. "
+        "Do not make up information. If you're unsure, ask for clarification. "
         "Stay helpful, polite, and focused on StarTech.com solutions."
     )]
 if "last_product_number" not in st.session_state: st.session_state.last_product_number = ""
@@ -933,6 +1055,15 @@ if prompt:
 
     handled = handle_explicit_product(prompt)
     if not handled:
+        # ====== NEW: treat clarification as follow-up on current SKU ======
+        if is_clarifying_followup(prompt):
+            if not st.session_state.last_context:
+                if handle_vague_follow_up(prompt): st.stop()
+            reply = render_conversational_answer(prompt)
+            reply = sanitize_reply(reply)
+            show_response(reply)
+            st.stop()
+
         if is_vague_follow_up(prompt):
             if handle_vague_follow_up(prompt): st.stop()
         else:
@@ -990,41 +1121,9 @@ if prompt:
 
     if not st.session_state.last_context:
         show_response(
-            "I couldn’t find a specific match yet. If you share a product number or more detail (e.g., interface, length, color), I’ll pull the exact specs."
+            "I couldn't find a specific match yet. If you share a product number or more detail (e.g., interface, length, color), I'll pull the exact specs."
         )
         st.stop()
-
-    final_filters = extract_filter_from_prompt(prompt)
-    print("\n--- Debug Info ---")
-    print(f"Active Filters: {final_filters}")
-    print(f"User Prompt: {prompt}")
-    print(f"Product Number: {st.session_state.last_product_number}")
-    print(f"Similarity Score: {st.session_state.last_score if st.session_state.last_score is not None else 'N/A'}")
-
-    cand_prompt = re.findall(r"[A-Z0-9-]{3,}", prompt.upper())
-    unrec_prompt = []
-    for c in cand_prompt:
-        if c in sku_set: continue
-        ch = c.replace("-", "")
-        if ch not in sku_map_nohyphen:
-            unrec_prompt.append(c)
-    if unrec_prompt:
-        print("Unrecognized SKU-like tokens (prompt):", sorted(set(unrec_prompt))[:20])
-
-    md = st.session_state.get("last_metadata") or {}
-    interesting_keys = (
-        "category", "subcategory", "material", "material_tags",
-        "fiberduplex", "fibertype", "ports", "displays", "color", "cablelength", "wireless",
-        "interface", "mounting_options",
-        "usb_c_ports", "usb_a_ports", "hdmi_ports", "dp_ports", "vga_ports"
-    )
-    print("Resolved Metadata (top doc):")
-    for k in interesting_keys:
-        if k in md:
-            print(f"- {k}: {md[k]}")
-    print("Context Retrieved:")
-    print(st.session_state.last_context)
-    print("-------------------\n")
 
     reply = render_conversational_answer(prompt)
     reply = sanitize_reply(reply)
