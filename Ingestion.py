@@ -1,3 +1,4 @@
+# Ingestion.py
 # Imports & Environment loading
 import os
 import time
@@ -603,6 +604,44 @@ def build_metadata(row):
         meta["material_tags"] = tags
         for t in tags:
             meta[f"mtag_{t}"] = True
+    # NEW: Add connector types as searchable metadata
+    if "INTERFACEA" in row and pd.notna(row.get("INTERFACEA")):
+        connector_a = str(row["INTERFACEA"]).strip().lower()
+        if connector_a:
+            meta["interfacea_full"] = connector_a
+            # Extract just the connector type (vga, hdmi, dvi, displayport, usb)
+            if "vga" in connector_a:
+                meta["interfacea_type"] = "vga"
+            elif "hdmi" in connector_a:
+                meta["interfacea_type"] = "hdmi"
+            elif "dvi" in connector_a:
+                meta["interfacea_type"] = "dvi"
+            elif "displayport" in connector_a or "display port" in connector_a:
+                meta["interfacea_type"] = "displayport"
+            elif "usb" in connector_a:
+                if "usb-c" in connector_a or "usbc" in connector_a or "type-c" in connector_a or "type c" in connector_a:
+                    meta["interfacea_type"] = "usb-c"
+                else:
+                    meta["interfacea_type"] = "usb"
+
+    if "INTERFACEB" in row and pd.notna(row.get("INTERFACEB")):
+        connector_b = str(row["INTERFACEB"]).strip().lower()
+        if connector_b:
+            meta["interfaceb_full"] = connector_b
+            # Extract just the connector type
+            if "vga" in connector_b:
+                meta["interfaceb_type"] = "vga"
+            elif "hdmi" in connector_b:
+                meta["interfaceb_type"] = "hdmi"
+            elif "dvi" in connector_b:
+                meta["interfaceb_type"] = "dvi"
+            elif "displayport" in connector_b or "display port" in connector_b:
+                meta["interfaceb_type"] = "displayport"
+            elif "usb" in connector_b:
+                if "usb-c" in connector_b or "usbc" in connector_b or "type-c" in connector_b or "type c" in connector_b:
+                    meta["interfaceb_type"] = "usb-c"
+                else:
+                    meta["interfaceb_type"] = "usb"
     # derived: per-connector port counts from multiple text columns
     text_sources = [row.get("CONNTYPE"), row.get("EXTERNALPORTS"), row.get("HOSTCONNECTOR")]
     for key, rx in PORT_PATTERNS.items():
@@ -643,3 +682,4 @@ for i in tqdm(range(0, len(documents), effective_batch), desc="Uploading to Pine
 
 print("Upload complete.")
 # The vector size from OpenAI’s text-embedding-3-large is 3072.
+

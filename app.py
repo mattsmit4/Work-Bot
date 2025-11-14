@@ -1,3 +1,4 @@
+# app.py
 import streamlit as st
 import os, json, re, string, csv
 from datetime import datetime
@@ -40,37 +41,101 @@ TEMP = float(env_optional("OPENAI_TEMPERATURE", "0.7"))
 EMBED_MODEL = env_optional("EMBED_MODEL", "text-embedding-3-large")
 
 # -------------------- NEW: Conversation Logging Function --------------------
-def log_to_csv(user_message, bot_response):
-    """Save conversation to a simple CSV file"""
+def log_to_csv(user_message, bot_response, products_shown=None):
+    """Enhanced logging with quality indicators"""
     try:
-        # Check if file exists to know if we need headers
+        import uuid
+        
         file_exists = os.path.exists('conversations.csv')
         
         with open('conversations.csv', 'a', newline='', encoding='utf-8') as f:
             writer = csv.writer(f)
             
-            # Write headers if new file
             if not file_exists:
                 writer.writerow([
                     'Timestamp',
+                    'Session ID',
+                    'Query Number',
                     'User Message',
                     'Bot Response',
                     'Product Number',
                     'Category',
                     'Subcategory',
-                    'Similarity Score'
+                    'Similarity Score',
+                    'Response Type',
+                    'Match Status',
+                    'Filters Applied',
+                    'Results Count'
                 ])
             
-            # Write the conversation
-            writer.writerow([
-                datetime.now().strftime('%Y-%m-%d %H:%M:%S'),
-                user_message,
-                bot_response,
-                st.session_state.get('last_product_number', ''),
-                st.session_state.get('last_metadata', {}).get('category', ''),
-                st.session_state.get('last_metadata', {}).get('subcategory', ''),
-                st.session_state.get('last_score', '')
-            ])
+            # Session tracking
+            if 'session_id' not in st.session_state:
+                st.session_state.session_id = str(uuid.uuid4())[:8]  # Short ID
+            if 'query_count' not in st.session_state:
+                st.session_state.query_count = 0
+            if 'last_query_time' not in st.session_state:
+                st.session_state.last_query_time = datetime.now()
+            
+            # Increment query count
+            st.session_state.query_count += 1
+            
+            # Check if this is a new session (more than 30 min since last query)
+            time_diff = (datetime.now() - st.session_state.last_query_time).total_seconds()
+            if time_diff > 1800:  # 30 minutes
+                st.session_state.session_id = str(uuid.uuid4())[:8]
+                st.session_state.query_count = 1
+            
+            st.session_state.last_query_time = datetime.now()
+            
+            # Determine match status
+            if st.session_state.get('last_product_number'):
+                match_status = 'success'
+            elif 'no match' in bot_response.lower() or 'couldn\'t find' in bot_response.lower():
+                match_status = 'no-match'
+            else:
+                match_status = 'other'
+            
+            # Get filters and results count
+            filters_applied = json.dumps(st.session_state.get('last_filters_applied', {}))
+            results_count = st.session_state.get('results_count', 0)
+            
+            timestamp = datetime.now().strftime('%Y-%m-%d %H:%M:%S')
+            
+            # Write row(s)
+            if products_shown and isinstance(products_shown, list):
+                for product in products_shown:
+                    writer.writerow([
+                        timestamp,
+                        st.session_state.session_id,
+                        st.session_state.query_count,
+                        user_message,
+                        bot_response,
+                        product.get('product_number', ''),
+                        product.get('category', ''),
+                        product.get('subcategory', ''),
+                        product.get('score', ''),
+                        'multi-product',
+                        match_status,
+                        filters_applied,
+                        len(products_shown)
+                    ])
+            else:
+                writer.writerow([
+                    timestamp,
+                    st.session_state.session_id,
+                    st.session_state.query_count,
+                    user_message,
+                    bot_response,
+                    st.session_state.get('last_product_number', ''),
+                    st.session_state.get('last_metadata', {}).get('category', ''),
+                    st.session_state.get('last_metadata', {}).get('subcategory', ''),
+                    st.session_state.get('last_score', ''),
+                    'single-product' if st.session_state.get('last_product_number') else 'no-product',
+                    match_status,
+                    filters_applied,
+                    results_count
+                ])
+            
     except Exception as e:
         print(f"Error logging conversation: {e}")
 
@@ -93,6 +158,58 @@ install_keywords = [
     "firmware", "driver install", "troubleshoot", "troubleshooting", "fix", "repair",
     "update firmware", "how to use", "step by step", "steps"
 ]
+
+# -------------------- Synonym & Abbreviation Expansion --------------------
+SYNONYMS = {
+    # Connector abbreviations
+    "dp": "displayport",
+    "tb": "thunderbolt",
+    "tb3": "thunderbolt 3",
+    "tb4": "thunderbolt 4",
+    
+    # Cable types
+    "cat5": "category 5 ethernet",
+    "cat5e": "category 5e ethernet",
+    "cat6": "category 6 ethernet",
+    "cat6a": "category 6a ethernet",
+    "cat7": "category 7 ethernet",
+    
+    # Video standards
+    "4k": "3840x2160",
+    "4k60": "4k 60hz",
+    "1080p": "1920x1080",
+    "720p": "1280x720",
+    
+    # Common phrases
+    "charger": "charging cable",
+    "power cord": "power cable",
+    "monitor cable": "display cable",
+    "laptop dock": "docking station",
+    
+    # Material variations
+    "braided": "nylon braided",
+    "aluminum": "aluminium",
+    
+    # Feature abbreviations
+    "poe": "power over ethernet",
+    "4k support": "4k display support",
+}
+
+def expand_synonyms(text: str) -> str:
+    """
+    Expand common abbreviations and synonyms in user queries.
+    Returns the expanded text with synonyms replaced.
+    """
+    text_lower = text.lower()
+    expanded = text_lower
+    
+    # Sort by length (longest first) to handle multi-word synonyms
+    for abbr, full in sorted(SYNONYMS.items(), key=lambda x: -len(x[0])):
+        # Use word boundaries to avoid partial matches
+        pattern = r'\b' + re.escape(abbr) + r'\b'
+        expanded = re.sub(pattern, full, expanded)
+    
+    return expanded
 
 # Treat "kvm ports" as the canonical Ports field; add per-connector derived fields too
 metadata_field_keywords = {
@@ -311,24 +428,70 @@ def _contains_any_token(text_norm: str, words: set[str]) -> bool:
     return any(w in toks for w in words)
 
 def pick_categories_from_prompt(prompt_text: str):
-    s_raw = prompt_text.lower().replace("type-c","type c").replace("usb-c","usb c").replace("wi-fi","wifi").replace("wi fi","wifi")
+    s_raw = prompt_text.lower()
+    
+    # Handle compound terms BEFORE general replacements
+    # Replace "USB-C" / "USB C" with a single token
+    s_raw = re.sub(r'\busb[\s\-]?c\b', 'usbc', s_raw, flags=re.I)
+    s_raw = re.sub(r'\btype[\s\-]?c\b', 'typec', s_raw, flags=re.I)
+    
+    # Now do general replacements
+    s_raw = s_raw.replace("wi-fi","wifi").replace("wi fi","wifi")
+    
+    print(f"DEBUG s_raw after replacements: {s_raw}")  # ← ADD THIS
+    
     tokens = [t for t in re.findall(r"[a-z0-9]+", s_raw) if t not in _STOPWORDS and len(t) >= 3 and t not in GENERIC]
+    print(f"DEBUG tokens extracted: {tokens}")  # ← ADD THIS
+    
     tokens_lem = {_lemma(t) for t in tokens}
+    print(f"DEBUG tokens_lem: {tokens_lem}")  # ← ADD THIS
 
     cats_src = categorical_values.get("category", [])
     subs_src = categorical_values.get("subcategory", [])
 
+    # NEW CODE - returns lowercase to match Pinecone metadata
     def word_overlap_hits(pool):
         hits = []
         for v in pool:
-            vn = norm_text(v)
+            vn = norm_text(v)  # Normalize for matching
             vwords = _tokset(vn)
             if vwords & tokens_lem:
-                hits.append(vn)
+                hits.append(v.lower())  # ← Return lowercase to match Pinecone!
         return sorted(list(dict.fromkeys(hits)))
 
     cat_hits = word_overlap_hits(cats_src)
     sub_hits = word_overlap_hits(subs_src)
+    
+    # ========== NEW: SMART FILTERING ==========
+    meaningful_tokens = tokens_lem - {"show", "cabl", "cable", "need", "want", "find", "get"}
+
+    if len(sub_hits) > 5 and meaningful_tokens:
+        # Find subcategories that contain ALL meaningful tokens
+        exact_matches = []
+        for s in sub_hits:
+            s_tokens = _tokset(s)
+            if meaningful_tokens.issubset(s_tokens):
+                exact_matches.append(s)
+        
+        if exact_matches:
+            sub_hits = exact_matches
+        else:
+            # Fallback: find subcategories with MOST token overlap
+            scored = []
+            for s in sub_hits:
+                s_tokens = _tokset(s)
+                overlap_count = len(meaningful_tokens & s_tokens)
+                if overlap_count > 0:
+                    scored.append((s, overlap_count))
+            
+            if scored:
+                scored.sort(key=lambda x: -x[1])
+                max_overlap = scored[0][1]
+                sub_hits = [s for s, count in scored if count == max_overlap]
+    # ========== END SMART FILTERING ==========
+
+    print(f"DEBUG cat_hits: {cat_hits}")  # ← ADD THIS
+    print(f"DEBUG sub_hits: {sub_hits}")  # ← ADD THIS
 
     display_intent    = _contains_any_token(s_raw, _DISPLAY_HINTS)
     networking_intent = _contains_any_token(s_raw, _NETWORK_HINTS)
@@ -344,8 +507,22 @@ def pick_categories_from_prompt(prompt_text: str):
     generic_bad = ("organizer", "organisers", "fastener", "accessor")
     sub_hits = [s for s in sub_hits if not any(b in s for b in generic_bad)]
 
-    if len(cat_hits) + len(sub_hits) == 0 or len(cat_hits) + len(sub_hits) > 20:
+    # NEW CODE:
+    if len(cat_hits) + len(sub_hits) == 0:
         return None
+        
+    # If we have too many hits, prioritize subcategory over category
+    if len(sub_hits) > 20:
+        # Keep only subcategories that exactly match the main token
+        main_tokens = {"usbc", "hdmi", "displayport", "ethernet", "thunderbolt", "dp", "dvi", "vga"}
+        exact_sub_hits = [s for s in sub_hits if any(tok in s for tok in (tokens_lem & main_tokens))]
+        if exact_sub_hits:
+            sub_hits = exact_sub_hits[:10]  # Limit to top 10
+        else:
+            sub_hits = sub_hits[:10]  # Fallback: just take first 10
+
+    if len(cat_hits) > 10:
+        cat_hits = cat_hits[:10]  # Limit to top 10
 
     out = {}
     if cat_hits:
@@ -451,24 +628,24 @@ def _satisfies_numeric(meta: dict, flt: dict) -> bool:
         if isinstance(cond, dict):
             if "$eq" in cond:
                 target = _to_num(cond["$eq"])
-                if target is None or v_num != target:
+                if target is None or v_num is None or v_num != target:
                     return False
                 continue
             if "$lt" in cond:
                 t = _to_num(cond["$lt"])
-                if t is None or not (v_num < t):
+                if t is None or v_num is None or not (v_num < t):
                     return False
             if "$lte" in cond:
                 t = _to_num(cond["$lte"])
-                if t is None or not (v_num <= t):
+                if t is None or v_num is None or not (v_num <= t):
                     return False
             if "$gt" in cond:
                 t = _to_num(cond["$gt"])
-                if t is None or not (v_num > t):
+                if t is None or v_num is None or not (v_num > t):
                     return False
             if "$gte" in cond:
                 t = _to_num(cond["$gte"])
-                if t is None or not (v_num >= t):
+                if t is None or v_num is None or not (v_num >= t):
                     return False
             if not any(k in cond for k in ("$lt", "$lte", "$gt", "$gte", "$eq")):
                 return False
@@ -478,7 +655,7 @@ def _satisfies_numeric(meta: dict, flt: dict) -> bool:
                     return False
                 continue
             target = _to_num(cond)
-            if target is None or v_num != target:
+            if target is None or v_num is None or v_num != target:
                 return False
     return True
 
@@ -722,7 +899,8 @@ def _extract_explicit_port_counts(prompt: str) -> dict:
     return out
 
 def extract_filter_from_prompt(prompt):
-    prompt_norm = norm_text(prompt)
+    prompt_expanded = expand_synonyms(prompt)
+    prompt_norm = norm_text(prompt_expanded)
     filters = {}
 
     # --- cable length ---
@@ -747,48 +925,189 @@ def extract_filter_from_prompt(prompt):
                     tol = _len_tol(mm)
                     filters["cablelength"] = {"$gte": mm - tol, "$lte": mm + tol}
 
-    # ---- Anchor category → dynamic category set
-    anchor = detect_anchor_rules(prompt_norm)
-    if anchor:
-        cat_values = _category_values_containing(anchor["key"])
-        if cat_values:
-            filters["category"] = {"$in": cat_values}
-        allow_subs = build_subcategory_allowlist(anchor.get("sub_token"), anchor.get("forbid"))
-        if allow_subs:
-            filters["subcategory"] = {"$in": allow_subs}
+    # ========== CONNECTOR MATCHING FIRST ==========
+    # ← NOTE: This is at the SAME level as the length section, not inside it!
+    p_lower = prompt.lower()
+    connector_matched = False
 
-    # ---- Token-based multi-category (using intent-aware picker)
-    multi_cat = pick_categories_from_prompt(prompt)
-    if multi_cat:
-        if "category" not in filters and "category" in multi_cat:
-            filters["category"] = multi_cat["category"]
-        if "subcategory" not in filters and "subcategory" in multi_cat:
-            filters["subcategory"] = multi_cat["subcategory"]
+    conn_pattern = r'\b(usb[\s\-]?c|usb[\s\-]?a|usb|hdmi|displayport|display\s*port|dp|dvi|vga)\b'
+    conn_matches = list(re.finditer(conn_pattern, p_lower, re.I))
+    has_side_language = bool(re.search(r'\b(side|end)\b.*(other|side|end)\b', p_lower))
 
-    # === NEW: explicit connector counts (take precedence)
+
+    # Pattern 1: "X on one side and Y on the other side/end"
+    if len(conn_matches) >= 2 and has_side_language:
+        conn_a = conn_matches[0].group(1).lower().replace(' ', '').replace('-', '')
+        conn_b = conn_matches[1].group(1).lower().replace(' ', '').replace('-', '')
+            
+        if conn_a != conn_b:
+            connector_matched = True
+            
+            # Map connector A
+            if 'usbc' in conn_a or 'typec' in conn_a:
+                filters["interfacea_type"] = "usb-c"
+            elif 'usba' in conn_a:
+                filters["interfacea_type"] = "usb-a"
+            elif conn_a == 'usb':
+                filters["interfacea_type"] = "usb"
+            elif conn_a == 'hdmi':
+                filters["interfacea_type"] = "hdmi"
+            elif 'displayport' in conn_a or conn_a == 'dp':
+                filters["interfacea_type"] = "displayport"
+            elif conn_a == 'dvi':
+                filters["interfacea_type"] = "dvi"
+            elif conn_a == 'vga':
+                filters["interfacea_type"] = "vga"
+            
+            # Map connector B
+            if 'usbc' in conn_b or 'typec' in conn_b:
+                filters["interfaceb_type"] = "usb-c"
+            elif 'usba' in conn_b:
+                filters["interfaceb_type"] = "usb-a"
+            elif conn_b == 'usb':
+                filters["interfaceb_type"] = "usb"
+            elif conn_b == 'hdmi':
+                filters["interfaceb_type"] = "hdmi"
+            elif 'displayport' in conn_b or conn_b == 'dp':
+                filters["interfaceb_type"] = "displayport"
+            elif conn_b == 'dvi':
+                filters["interfaceb_type"] = "dvi"
+            elif conn_b == 'vga':
+                filters["interfaceb_type"] = "vga"
+            
+            print(f"DEBUG: Connector matched! interfacea_type={filters.get('interfacea_type')}, interfaceb_type={filters.get('interfaceb_type')}")  # DEBUG
+
+    # Pattern 2: "X to Y" style patterns (only if Pattern 1 didn't match)
+    if not connector_matched:
+        # NEW: Handle USB-C to HDMI specifically (must come BEFORE generic USB to HDMI)
+        if re.search(r'\busb[\s\-]?c\s+to\s+hdmi\b', p_lower):
+            filters["interfacea_type"] = "usb-c"
+            filters["interfaceb_type"] = "hdmi"
+            connector_matched = True
+            print(f"DEBUG: USB-C to HDMI matched!")
+        elif re.search(r'\bhdmi\s+to\s+usb[\s\-]?c\b', p_lower):
+            filters["interfacea_type"] = "hdmi"
+            filters["interfaceb_type"] = "usb-c"
+            connector_matched = True
+            print(f"DEBUG: HDMI to USB-C matched!")
+        # VGA patterns
+        elif re.search(r'\bvga\s+to\s+hdmi\b', p_lower):
+            filters["interfacea_type"] = "vga"
+            filters["interfaceb_type"] = "hdmi"
+            connector_matched = True
+            print(f"DEBUG: VGA to HDMI matched!")
+        elif re.search(r'\bhdmi\s+to\s+vga\b', p_lower):
+            filters["interfacea_type"] = "hdmi"
+            filters["interfaceb_type"] = "vga"
+            connector_matched = True
+            print(f"DEBUG: HDMI to VGA matched!")
+        # Generic USB to HDMI (must come AFTER USB-C specific patterns)
+        elif re.search(r'\busb\s+to\s+hdmi\b', p_lower):
+            # This will only match if it's NOT USB-C (since USB-C was already handled)
+            filters["interfacea_type"] = "usb"
+            filters["interfaceb_type"] = "hdmi"
+            connector_matched = True
+            print(f"DEBUG: USB to HDMI matched!")
+        # DisplayPort patterns
+        elif re.search(r'\b(?:displayport|display\s*port|dp)\s+to\s+hdmi\b', p_lower):
+            filters["interfacea_type"] = "displayport"
+            filters["interfaceb_type"] = "hdmi"
+            connector_matched = True
+            print(f"DEBUG: DisplayPort to HDMI matched!")
+        elif re.search(r'\bhdmi\s+to\s+(?:displayport|display\s*port|dp)\b', p_lower):
+            filters["interfacea_type"] = "hdmi"
+            filters["interfaceb_type"] = "displayport"
+            connector_matched = True
+            print(f"DEBUG: HDMI to DisplayPort matched!")
+        # DVI patterns
+        elif re.search(r'\bdvi\s+to\s+hdmi\b', p_lower):
+            filters["interfacea_type"] = "dvi"
+            filters["interfaceb_type"] = "hdmi"
+            connector_matched = True
+            print(f"DEBUG: DVI to HDMI matched!")
+        elif re.search(r'\bhdmi\s+to\s+dvi\b', p_lower):
+            filters["interfacea_type"] = "hdmi"
+            filters["interfaceb_type"] = "dvi"
+            connector_matched = True
+            print(f"DEBUG: HDMI to DVI matched!")
+
+    print(f"DEBUG: connector_matched = {connector_matched}")  # DEBUG
+    print(f"DEBUG: Current filters = {filters}")  # DEBUG
+
+    # ========== END CONNECTOR MATCHING ==========
+
+    # NOW the conditional category logic:
+
+    # ---- Anchor category (skip if connector matched) ----
+    if not connector_matched:
+        anchor = detect_anchor_rules(prompt_norm)
+        if anchor:
+            cat_values = _category_values_containing(anchor["key"])
+            if cat_values:
+                filters["category"] = {"$in": cat_values}
+            allow_subs = build_subcategory_allowlist(anchor.get("sub_token"), anchor.get("forbid"))
+            if allow_subs:
+                filters["subcategory"] = {"$in": allow_subs}
+    else:
+        print(f"DEBUG: Skipping anchor because connector_matched=True")  # DEBUG
+
+    # Replace the section in extract_filter_from_prompt after connector matching
+    # Starting from "# ---- Token-based multi-category..." 
+
+    # Track cable intent for smart filtering
+    cable_intent = "cable" in prompt_norm or "cables" in prompt_norm
+
+    # ---- Token-based multi-category (skip if connector matched) ----
+    if not connector_matched:
+        multi_cat = pick_categories_from_prompt(prompt)
+        multi_cat_keys = set(multi_cat.keys()) if multi_cat else set()
+
+        if multi_cat:
+            if "category" in multi_cat:
+                filters["category"] = multi_cat["category"]
+            if "subcategory" in multi_cat:
+                filters["subcategory"] = multi_cat["subcategory"]
+    else:
+        # If connector matched, use broad category allowlist
+        print(f"DEBUG: Connector matched - using broad categories")  # DEBUG
+        all_cats = categorical_values.get("category", [])
+        connector_cats = [
+            norm_text(c) for c in all_cats 
+            if any(keyword in norm_text(c) for keyword in 
+                ["cable", "display", "video", "connectivity", "adapter", "converter", "av"])
+        ]
+        print(f"DEBUG: connector_cats = {connector_cats}")  # DEBUG
+        if connector_cats:
+            filters["category"] = {"$in": connector_cats}
+        multi_cat_keys = set()  # Empty set to skip later categorical matching
+        
+        # NEW: If user said "cable", prevent subcategory filtering to allow adapters/converters
+        if cable_intent:
+            print(f"DEBUG: Cable intent detected - will skip subcategory filtering")  # DEBUG
+            multi_cat_keys.add("subcategory")  # Mark as handled to prevent addition
+
+    # === Explicit connector counts ===
     explicit_counts = _extract_explicit_port_counts(prompt)
     if explicit_counts:
         for k, v in explicit_counts.items():
             filters[k] = v
 
-    # --- numeric fields (global / near-keyword)
+    # --- numeric fields (global / near-keyword) ---
     rng_any = parse_global_range(prompt)
     for field, keywords in metadata_field_keywords.items():
         if field == "cablelength":
             continue
-        # skip if we already set an explicit count for this field
         if field in filters:
             continue
 
         if any(kw in prompt_norm for kw in keywords):
-            # try near-number first (e.g., "2 HDMI")
             val = find_number_near_keywords(prompt_norm, keywords)
             if val is not None:
                 filters[field] = val
             elif rng_any:
                 filters[field] = rng_any
 
-    # --- SPECIAL: pack quantity from "two-pack", "3 pack", etc.
+    # --- SPECIAL: pack quantity ---
     m_pack = re.search(r'\b(\d+|' + "|".join(_NUM_WORDS.keys()) + r')\s*[- ]?pack\b', prompt_norm)
     if m_pack:
         token = m_pack.group(1)
@@ -796,10 +1115,18 @@ def extract_filter_from_prompt(prompt):
         if qty is not None:
             filters["packqty"] = {"$eq": float(qty)}
 
-    # --- categorical (fallback fuzzy if not already set)
+    # --- categorical (fallback fuzzy if not already set) ---
     for meta_key in ("category", "subcategory", "material", "fiberduplex", "fibertype", "color", "wireless"):
-        if (multi_cat and meta_key in multi_cat) or (anchor and meta_key in ("category","subcategory") and meta_key in filters):
+        if meta_key in multi_cat_keys:
             continue
+        if meta_key in filters:
+            continue
+        
+        # NEW: Skip subcategory when connector matched + cable intent
+        if connector_matched and cable_intent and meta_key == "subcategory":
+            print(f"DEBUG: Skipping subcategory filter due to cable intent + connector matching")  # DEBUG
+            continue
+        
         val = try_match_categorical(meta_key, prompt_norm)
         if val:
             filters[meta_key] = val
@@ -824,8 +1151,8 @@ def extract_filter_from_prompt(prompt):
         else:
             filters["ports"] = cond
 
-    # If the prompt says "cable" and we have a length filter, bias to cable categories
-    if ("cablelength" in filters) and ("cable" in prompt_norm):
+    # Cable category bias
+    if ("cablelength" in filters) and ("cable" in prompt_norm) and not connector_matched:
         cable_cats = [norm_text(v) for v in (categorical_values.get("category") or []) if v and "cable" in v.lower()]
         cable_cats = [c for c in cable_cats if not any(bad in c for bad in ("organizer","organiser","fastener","accessor"))]
         if cable_cats:
@@ -838,6 +1165,9 @@ def extract_filter_from_prompt(prompt):
                 if not filters["subcategory"]["$in"]:
                     filters.pop("subcategory", None)
 
+    # Store filters for logging
+    st.session_state.last_filters_applied = filters
+    
     return filters or None
 
 def show_response(reply):
@@ -845,7 +1175,6 @@ def show_response(reply):
         st.markdown(reply)
     st.session_state.messages.append(AIMessage(reply))
     
-    # NEW: Log the conversation
     # Get the last user message
     last_user_msg = ""
     for msg in reversed(st.session_state.messages[:-1]):
@@ -854,7 +1183,17 @@ def show_response(reply):
             break
     
     if last_user_msg:
-        log_to_csv(last_user_msg, reply)
+        # Check if this is a multi-product response
+        multi_products = st.session_state.get('multi_products_shown')
+        
+        if multi_products:
+            # Log with product list
+            log_to_csv(last_user_msg, reply, products_shown=multi_products)
+            # Clear the multi-product list
+            st.session_state.multi_products_shown = None
+        else:
+            # Log as single product
+            log_to_csv(last_user_msg, reply)
 
 def render_conversational_answer(prompt_text:str)->str:
     pn = st.session_state.last_product_number or "(unknown)"
@@ -981,6 +1320,107 @@ def _modal_category_fallback(original_filters: dict, prompt: str, top_k: int = 3
         new_filters.pop("subcategory", None)
     return new_filters
 
+def _score_product_simplicity(metadata: dict) -> float:
+    """
+    Score products based on simplicity for cable/adapter queries.
+    Higher score = simpler/more direct product.
+    """
+    subcat = (metadata.get("subcategory") or "").lower()
+    
+    # Penalize complex systems
+    if any(word in subcat for word in ["table", "panel", "box", "system", "module", "rack"]):
+        return 0.3
+    
+    # Boost direct cables/adapters
+    if any(word in subcat for word in ["cable", "adapter", "converter"]):
+        return 1.0
+    
+    return 0.7  # neutral
+
+def _should_show_multiple_products(prompt: str, num_matches: int) -> bool:
+    """
+    Determine if we should show multiple products instead of just one.
+    """
+    if num_matches < 3:
+        return False
+    
+    p_lower = prompt.lower()
+    
+    # Exploratory phrases that suggest wanting options
+    exploratory_phrases = [
+        "show me", "what are", "what options", "do you have", "can you show",
+        "list", "compare", "what's available", "what models", "which ones",
+        "give me options", "any", "some", "a few"
+    ]
+    
+    if any(phrase in p_lower for phrase in exploratory_phrases):
+        return True
+    
+    # If query is very short and vague (3 words or less)
+    words = [w for w in prompt.split() if w.lower() not in _STOPWORDS]
+    if len(words) <= 3:
+        return True
+    
+    return False
+
+def _build_multi_product_response(products: list, prompt: str) -> str:
+    """
+    Build a response showing multiple products (3-5 max).
+    Returns formatted markdown with product summaries.
+    Also stores product info in session state for logging.
+    """
+    # Limit to top 5
+    products = products[:5]
+    
+    # NEW: Store products for logging
+    products_for_logging = []
+    
+    response = f"I found {len(products)} products that match your search:\n\n"
+    
+    for i, doc in enumerate(products, 1):
+        meta = doc.metadata or {}
+        pn = meta.get("product_number", "Unknown")
+        cat = meta.get("category", "").title()
+        subcat = meta.get("subcategory", "").title()
+        
+        # NEW: Add to logging list
+        products_for_logging.append({
+            'product_number': pn,
+            'category': meta.get('category', ''),
+            'subcategory': meta.get('subcategory', ''),
+            'score': 1.0  # Multi-product responses don't have individual scores
+        })
+        
+        # Extract key specs from page_content
+        content_lines = doc.page_content.split('\n')
+        key_specs = []
+        
+        priority_keywords = ["Cable Length:", "Connector A:", "Connector B:", "Ports:", "Displays:"]
+        for keyword in priority_keywords:
+            for line in content_lines:
+                if keyword in line:
+                    spec = line.strip()
+                    if spec and len(spec) < 100:
+                        key_specs.append(spec)
+                    break  # Found this keyword, move to next
+            if len(key_specs) >= 3:
+                break
+        
+        response += f"**{i}. {pn}**\n"
+        if subcat:
+            response += f"*{subcat}*\n"
+        if key_specs:
+            for spec in key_specs:
+                response += f"- {spec}\n"
+        response += "\n"
+    
+    response += "Would you like detailed specs on any of these? Just let me know the product number!"
+    
+    # NEW: Store in session state for logging
+    st.session_state.multi_products_shown = products_for_logging
+    
+    return response
+
 def handle_descriptive_query(prompt, f_override=None):
     f = f_override if f_override is not None else extract_filter_from_prompt(prompt)
     st.session_state.last_product_number = ""
@@ -990,14 +1430,24 @@ def handle_descriptive_query(prompt, f_override=None):
     try:
         if f:
             docs = vector_store.similarity_search("product spec", k=50, filter=f)
+            
+            # Store results count for logging
+            st.session_state.results_count = len(docs) if docs else 0
+            
             if docs:
+                # If we have connector filters, re-rank by simplicity
+                if "interfacea_type" in f or "interfaceb_type" in f:
+                    scored = [(doc, _score_product_simplicity(doc.metadata)) for doc in docs]
+                    scored.sort(key=lambda x: x[1], reverse=True)
+                    docs = [doc for doc, score in scored]
+                
+                # Check if we should show multiple products
+                if _should_show_multiple_products(prompt, len(docs)):
+                    multi_response = _build_multi_product_response(docs, prompt)
+                    show_response(multi_response)
+                    return True
+                
                 return use_top_result([(docs[0], 1.0)])
-            rerouted = _modal_category_fallback(f, prompt, top_k=30)
-            if rerouted:
-                docs = vector_store.similarity_search("product spec", k=50, filter=rerouted)
-                if docs:
-                    st.session_state.last_rerouted_filters = rerouted
-                    return use_top_result([(docs[0], 1.0)])
     except Exception as e:
         print(f"Metadata-filtered search failed: {e}")
 
@@ -1119,7 +1569,12 @@ if prompt:
                 )
                 st.stop()
 
-    if not st.session_state.last_context:
+    # Only show fallback if we haven't already given a response
+    if not st.session_state.last_context and len(st.session_state.messages) > 0:
+        # Check if last message was from assistant (we already responded)
+        if isinstance(st.session_state.messages[-1], AIMessage):
+            st.stop()  # Already responded, don't show fallback
+        
         show_response(
             "I couldn't find a specific match yet. If you share a product number or more detail (e.g., interface, length, color), I'll pull the exact specs."
         )
