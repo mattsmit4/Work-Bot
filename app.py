@@ -568,7 +568,7 @@ def pick_categories_from_prompt(prompt_text: str):
 # -------------------- Anchor map with dynamic category generation --------------------
 _ANCHORS = [
     (["kvm"],               "kvm",              {"sub_token": "kvm",        "forbid": ["dock", "enclosure"]}),
-    (["dock","docking"],    "dock",             {"sub_token": "dock",       "forbid": ["enclosure","drive bay","drive bays"]}),
+    (["dock","docking"],    "dock",             {"sub_token": "dock",       "forbid": ["enclosure","drive bay","drive bays","drive docking","cable","adapter"]}),
     (["enclosure","bay","bays","drive bay","drive bays"], "enclosure", {"sub_token": "enclosure",  "forbid": ["dock"]}),
     (["rack","cabinet"],    "rack",             {"sub_token": "rack",       "forbid": ["dock"]}),
 ]
@@ -771,27 +771,32 @@ def _parse_length_filter(prompt: str):
     return {"$lte": hi}
 
 def find_number_near_keywords(prompt_norm: str, keywords: list[str]):
+    """
+    Extract numeric filters near keywords.
+    Uses the global range parser for consistency.
+    """
     for kw in keywords:
+        # Check if keyword is mentioned
+        if kw not in prompt_norm:
+            continue
+        
+        # First, try to find a range/comparison in the prompt
+        global_range = parse_global_range(prompt_norm)
+        if global_range:
+            return global_range
+        
+        # If no range found, look for exact numbers near the keyword
         kw_esc = re.escape(kw)
-
-        # case: "3 or more displays"
-        m = re.search(rf'(\d+)(?:\s*or\s*more)\s+{kw_esc}\b', prompt_norm)
-        if m:
-            return {"$gte": float(m.group(1))}
-
-        # case: "3 or less displays"
-        m = re.search(rf'(\d+)(?:\s*or\s*less)\s+{kw_esc}\b', prompt_norm)
-        if m:
-            return {"$lte": float(m.group(1))}
-
-        # existing near-keyword matches
+        
+        # Pattern: "3 ports" or "ports 3"
         m = re.search(rf'(\d+(?:\.\d+)?)\s+{kw_esc}\b', prompt_norm)
         if m:
             return {"$eq": float(m.group(1))}
+        
         m = re.search(rf'\b{kw_esc}\s+(\d+(?:\.\d+)?)', prompt_norm)
         if m:
             return {"$eq": float(m.group(1))}
-
+    
     return None
 
 # --- phrases that imply pivoting away from the current SKU
@@ -968,9 +973,30 @@ def extract_filter_from_prompt(prompt):
     conn_matches = list(re.finditer(conn_pattern, p_lower, re.I))
     has_side_language = bool(re.search(r'\b(side|end)\b.*(other|side|end)\b', p_lower))
 
+    # Pattern 0: Single connector cables (e.g., "HDMI cable", "USB-C cable")
+    # BUT: Skip if there's an "X to Y" pattern (that should be handled by Pattern 2)
+    has_to_pattern = re.search(r'\bto\b', p_lower) and len(conn_matches) >= 2
+    
+    if not has_to_pattern:
+        single_conn_patterns = {
+            'hdmi': r'\bhdmi\s+cable\b',
+            'displayport': r'\b(?:displayport|display\s*port|dp)\s+cable\b',
+            'vga': r'\bvga\s+cable\b',
+            'dvi': r'\bdvi\s+cable\b',
+            'usb-c': r'\busb[\s\-]?c\s+cable\b',
+            'usb-a': r'\busb[\s\-]?a\s+cable\b',
+        }
+        
+        for conn_type, pattern in single_conn_patterns.items():
+            if re.search(pattern, p_lower):
+                filters["interfacea_type"] = conn_type
+                filters["interfaceb_type"] = conn_type
+                connector_matched = True
+                print(f"DEBUG: Single connector cable matched: {conn_type}")
+                break
 
     # Pattern 1: "X on one side and Y on the other side/end"
-    if len(conn_matches) >= 2 and has_side_language:
+    if not connector_matched and len(conn_matches) >= 2 and has_side_language:
         conn_a = conn_matches[0].group(1).lower().replace(' ', '').replace('-', '')
         conn_b = conn_matches[1].group(1).lower().replace(' ', '').replace('-', '')
             
@@ -1109,14 +1135,21 @@ def extract_filter_from_prompt(prompt):
 
     # ---- Token-based multi-category (skip if connector matched) ----
     if not connector_matched:
+        # Check if anchor already set subcategories
+        anchor_set_subcategory = "subcategory" in filters
+        
         multi_cat = pick_categories_from_prompt(prompt)
         multi_cat_keys = set(multi_cat.keys()) if multi_cat else set()
 
         if multi_cat:
             if "category" in multi_cat:
                 filters["category"] = multi_cat["category"]
-            if "subcategory" in multi_cat:
+            # Only apply subcategory from token-based if anchor didn't set it
+            if "subcategory" in multi_cat and not anchor_set_subcategory:
                 filters["subcategory"] = multi_cat["subcategory"]
+                print(f"DEBUG: Token-based added subcategories")
+            elif anchor_set_subcategory:
+                print(f"DEBUG: Keeping anchor subcategories, skipping token-based")
     else:
         # If connector matched, use broad category allowlist
         print(f"DEBUG: Connector matched - using broad categories")  # DEBUG
@@ -1724,3 +1757,6 @@ if prompt:
     reply = render_conversational_answer(prompt)
     reply = sanitize_reply(reply)
     show_response(reply)
+
+
+    
