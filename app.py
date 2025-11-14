@@ -508,6 +508,20 @@ def pick_categories_from_prompt(prompt_text: str):
     generic_bad = ("organizer", "organisers", "fastener", "accessor")
     sub_hits = [s for s in sub_hits if not any(b in s for b in generic_bad)]
 
+    # ========== NEW: Don't over-filter with single subcategory ==========
+    # If we only have 1 subcategory match but it's very specific,
+    # drop it and just use the category for a broader search
+    if len(sub_hits) == 1 and len(cat_hits) >= 1:
+        # Check if the subcategory is overly specific
+        specific_indicators = ["drive", "usb-a", "usb-c", "thunderbolt", "type-c", "displayport", "hdmi"]
+        subcat_lower = sub_hits[0].lower()
+        
+        # If it contains specific tech terms, drop the subcategory filter
+        if any(indicator in subcat_lower for indicator in specific_indicators):
+            print(f"DEBUG: Dropping overly specific subcategory '{sub_hits[0]}' to broaden search")
+            sub_hits = []
+    # ====================================================================
+
     # NEW CODE:
     if len(cat_hits) + len(sub_hits) == 0:
         return None
@@ -528,8 +542,27 @@ def pick_categories_from_prompt(prompt_text: str):
     out = {}
     if cat_hits:
         out["category"] = {"$in": cat_hits}
+
+    # ========== NEW: Only add subcategory if it's genuinely helpful ==========
+    # Don't add subcategory filter for broad exploratory queries
+    # Only add it when:
+    # 1. User is being specific (3+ meaningful tokens), OR
+    # 2. Multiple subcategories match (shows user intent is clear)
     if sub_hits:
-        out["subcategory"] = {"$in": sub_hits}
+        # Count meaningful tokens (excluding stopwords and generic terms)
+        query_tokens = tokens_lem - {"show", "cabl", "cable", "need", "want", "find", "get", "have", "any"}
+        
+        # Only apply subcategory filter if:
+        # - User query has 3+ specific tokens (e.g., "usb-c thunderbolt docking station"), OR
+        # - Multiple subcategories matched (shows clear intent), OR
+        # - Only 1 category but multiple subcategories (refinement needed)
+        if len(query_tokens) >= 3 or len(sub_hits) >= 3 or (len(cat_hits) == 1 and len(sub_hits) >= 2):
+            out["subcategory"] = {"$in": sub_hits}
+            print(f"DEBUG: Applying subcategory filter with {len(sub_hits)} options")
+        else:
+            print(f"DEBUG: Skipping subcategory filter for broad query (only {len(query_tokens)} specific tokens)")
+    # ====================================================================
+
     return out or None
 
 # -------------------- Anchor map with dynamic category generation --------------------
@@ -1046,11 +1079,27 @@ def extract_filter_from_prompt(prompt):
             cat_values = _category_values_containing(anchor["key"])
             if cat_values:
                 filters["category"] = {"$in": cat_values}
-            allow_subs = build_subcategory_allowlist(anchor.get("sub_token"), anchor.get("forbid"))
-            if allow_subs:
-                filters["subcategory"] = {"$in": allow_subs}
-    else:
-        print(f"DEBUG: Skipping anchor because connector_matched=True")  # DEBUG
+            
+            # ========== NEW: Only add anchor subcategories if query is specific ==========
+            # Only add subcategories if query mentions specific technologies
+            query_lower = prompt_norm.lower()
+
+            specific_tech_terms = {
+                "usb", "usbc", "usb-c", "usb-a", "usba", "thunderbolt", "tb3", "tb4",
+                "hdmi", "displayport", "dp", "vga", "dvi", "ethernet", "4k", "dual", "triple"
+            }
+
+            query_words_set = set(re.findall(r"[a-z0-9]+", query_lower))
+            has_specific_tech = bool(query_words_set & specific_tech_terms)
+
+            if has_specific_tech:
+                allow_subs = build_subcategory_allowlist(anchor.get("sub_token"), anchor.get("forbid"))
+                if allow_subs:
+                    filters["subcategory"] = {"$in": allow_subs}
+                    print(f"DEBUG: Anchor added {len(allow_subs)} subcategories for specific query")
+            else:
+                print(f"DEBUG: Anchor skipped subcategory filter for broad query")
+            # ================================================================================
 
     # Replace the section in extract_filter_from_prompt after connector matching
     # Starting from "# ---- Token-based multi-category..." 
