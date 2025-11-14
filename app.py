@@ -3,6 +3,7 @@ import streamlit as st
 import os, json, re, string, csv
 from datetime import datetime
 from dotenv import load_dotenv
+import pandas as pd
 
 from pinecone import Pinecone
 from langchain_pinecone import PineconeVectorStore
@@ -1493,6 +1494,97 @@ for msg in st.session_state.messages:
     if isinstance(msg, SystemMessage): continue
     with st.chat_message("user" if isinstance(msg, HumanMessage) else "assistant"):
         st.markdown(msg.content)
+
+# ========== ADMIN SECTION: Password Protected Conversation Viewer ==========
+with st.sidebar:
+    st.markdown("---")
+    st.markdown("### 🔐 Admin Access")
+    admin_password = st.text_input("Enter Admin Password", type="password", key="admin_pw")
+    
+    # Check password (uses environment variable or default)
+    correct_password = os.getenv("ADMIN_PASSWORD", "startech2025")
+    
+    if admin_password and admin_password == correct_password:
+        st.success("✅ Admin access granted")
+        
+        # Show conversation logs button
+        if st.button("📊 View Conversation Logs"):
+            if os.path.exists('conversations.csv'):
+                try:
+                    df = pd.read_csv('conversations.csv')
+                    
+                    st.subheader("📋 Recent Conversations")
+                    st.caption(f"Total conversations logged: {len(df)}")
+                    
+                    # Show filters
+                    col1, col2 = st.columns(2)
+                    
+                    with col1:
+                        filter_type = st.selectbox(
+                            "Filter by Response Type",
+                            ["All", "single-product", "multi-product", "no-product"]
+                        )
+                    
+                    with col2:
+                        filter_status = st.selectbox(
+                            "Filter by Match Status",
+                            ["All", "success", "no-match", "other"]
+                        )
+                    
+                    # Apply filters
+                    filtered_df = df.copy()
+                    if filter_type != "All":
+                        filtered_df = filtered_df[filtered_df['Response Type'] == filter_type]
+                    if filter_status != "All":
+                        filtered_df = filtered_df[filtered_df['Match Status'] == filter_status]
+                    
+                    # Show number of rows to display
+                    num_rows = st.slider("Number of rows to display", 10, 100, 50)
+                    
+                    # Display the data
+                    st.dataframe(
+                        filtered_df.tail(num_rows),
+                        use_container_width=True,
+                        height=400
+                    )
+                    
+                    st.caption(f"Showing {min(num_rows, len(filtered_df))} of {len(filtered_df)} filtered rows")
+                    
+                    # Download button
+                    csv_data = df.to_csv(index=False).encode('utf-8')
+                    st.download_button(
+                        label="💾 Download Full CSV",
+                        data=csv_data,
+                        file_name=f"conversations_{datetime.now().strftime('%Y%m%d_%H%M%S')}.csv",
+                        mime="text/csv",
+                        help="Download all conversation logs for Power BI analysis"
+                    )
+                    
+                    # Quick stats
+                    st.markdown("---")
+                    st.markdown("### 📊 Quick Stats")
+                    
+                    stats_col1, stats_col2, stats_col3 = st.columns(3)
+                    
+                    with stats_col1:
+                        total_sessions = df['Session ID'].nunique()
+                        st.metric("Total Sessions", total_sessions)
+                    
+                    with stats_col2:
+                        avg_queries = df.groupby('Session ID')['Query Number'].max().mean()
+                        st.metric("Avg Queries/Session", f"{avg_queries:.1f}")
+                    
+                    with stats_col3:
+                        success_rate = (df['Match Status'] == 'success').sum() / len(df) * 100
+                        st.metric("Success Rate", f"{success_rate:.1f}%")
+                    
+                except Exception as e:
+                    st.error(f"Error reading CSV: {e}")
+            else:
+                st.warning("⚠️ No conversation logs found yet. Start chatting to generate data!")
+    
+    elif admin_password:
+        st.error("❌ Incorrect password")
 
 prompt = st.chat_input("Ask about a StarTech.com product")
 if prompt:
