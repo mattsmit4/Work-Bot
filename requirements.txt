@@ -2,8 +2,8 @@ streamlit
 python-dotenv
 pandas
 openpyxl
-pinecone>=3.0.0
+pinecone>=6.0.0
 langchain
 langchain-openai
-langchain-pinecone>=0.1.0
+langchain-pinecone>=0.2.0
 tqdm
