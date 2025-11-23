@@ -773,29 +773,35 @@ def _parse_length_filter(prompt: str):
 def find_number_near_keywords(prompt_norm: str, keywords: list[str]):
     """
     Extract numeric filters near keywords.
-    Uses the global range parser for consistency.
+    Context-aware to avoid version numbers and model numbers.
     """
     for kw in keywords:
-        # Check if keyword is mentioned
         if kw not in prompt_norm:
             continue
         
-        # First, try to find a range/comparison in the prompt
         global_range = parse_global_range(prompt_norm)
         if global_range:
             return global_range
         
-        # If no range found, look for exact numbers near the keyword
         kw_esc = re.escape(kw)
         
-        # Pattern: "3 ports" or "ports 3"
-        m = re.search(rf'(\d+(?:\.\d+)?)\s+{kw_esc}\b', prompt_norm)
-        if m:
-            return {"$eq": float(m.group(1))}
+        pats = [
+            rf'(\d+)\s*[x×]\s*{kw_esc}\b',
+            rf'\b{kw_esc}\s*[x×]\s*(\d+)',
+            rf'(\d+)\s+{kw_esc}\s+(?:ports?|count)\b',
+            rf'\b{kw_esc}\s+(?:ports?|count)[:\s]*(\d+)',
+            rf'\b{kw_esc}[:\-]\s*(\d+)\b',
+        ]
         
-        m = re.search(rf'\b{kw_esc}\s+(\d+(?:\.\d+)?)', prompt_norm)
-        if m:
-            return {"$eq": float(m.group(1))}
+        for p in pats:
+            m = re.search(p, prompt_norm)
+            if m:
+                try:
+                    num = int(m.group(1))
+                    if 1 <= num <= 12:
+                        return {"$eq": float(num)}
+                except:
+                    pass
     
     return None
 
@@ -805,7 +811,11 @@ _PIVOT_PHRASES = {
     "similar to this but", "like this but", "do you have", "looking for",
     "need a", "not this", "without", "alternative", "alternatives",
     "other option", "other options", "different option", "different options",
-    "another option", "another one"
+    "another option", "another one",
+    
+    # NEW: Explicit search phrases that should trigger new product search
+    "show me", "show", "find me", "find", "give me", "get me",
+    "i want", "i need", "what about", "how about"
 }
 
 # ====== NEW: clarification phrases to prevent false pivots ======
@@ -828,6 +838,12 @@ def _looks_like_new_product_query(p_norm: str) -> bool:
     if any(phrase in p_norm for phrase in _PIVOT_PHRASES):
         return True
 
+    # NEW: Explicit search verbs should ALWAYS trigger new search
+    search_verbs = {"show", "find", "get", "give", "list"}
+    tokens = set(p_norm.split())
+    if any(verb in tokens for verb in search_verbs):
+        return True
+
     has_domain = any(tok in p_norm for tok in _DOMAIN_SEEK_TOKENS)
     has_numbery = (
         bool(re.search(r'\d', p_norm)) or
@@ -843,6 +859,11 @@ def _looks_like_new_product_query(p_norm: str) -> bool:
 def is_vague_follow_up(prompt):
     last_pn = st.session_state.get("last_product_number") or ""
     p_norm = norm_text(prompt)
+    
+    # NEW: Meta-queries should never be treated as vague follow-ups
+    if detect_meta_query(prompt):
+        return False
+    
     if last_pn:
         has_new_sku = bool(extract_product_number(prompt))
         anchor = detect_anchor_rules(p_norm)
@@ -908,33 +929,175 @@ _EXPL_PORT_PATTERNS = {
     "vga_ports":   r"(?:vga)"
 }
 
+def detect_daisy_chain_intent(prompt: str) -> bool:
+    """
+    Detect if user is asking about daisy-chaining monitors.
+    Returns True if daisy-chain keywords are present.
+    """
+    p_lower = prompt.lower()
+    
+    daisy_chain_keywords = [
+        "daisy-chain", "daisy chain", "daisychain",
+        "daisy-chained", "daisy chained", "daisychained",
+        "chain monitors", "chaining monitors",
+        "connect monitors in series", "series connection"
+    ]
+    
+    return any(keyword in p_lower for keyword in daisy_chain_keywords)
+
+def detect_multi_product_followup(prompt: str) -> bool:
+    """
+    Detect if user is asking about the previously shown multi-product list.
+    Returns True if this is a follow-up query about "all", "these", "compare", etc.
+    """
+    if not st.session_state.get('last_multi_products'):
+        return False
+    
+    p_lower = prompt.lower()
+    
+    followup_patterns = [
+        r'\ball\b',
+        r'\beach\b',
+        r'\bboth\b',
+        r'\bthese\b',
+        r'\bthem\b',
+        r'\bthose\b',
+        r'\bcompare\b',
+        r'\bdifferences?\b',
+        r'\bmore\s+(?:info|details?|specs?)\b',
+        r'\bexplain.*(?:all|each|these|them)\b',
+        r'\btell\s+me\s+(?:about|more)\s+(?:all|each|these|them)\b',
+    ]
+    
+    if any(re.search(pattern, p_lower) for pattern in followup_patterns):
+        if not _looks_like_new_product_query(norm_text(prompt)):
+            return True
+    
+    return False
+
+def handle_multi_product_followup(prompt: str) -> bool:
+    """
+    Handle follow-up queries about previously shown multi-product list.
+    Provides detailed information about all products in the list.
+    """
+    products = st.session_state.get('last_multi_products', [])
+    
+    if not products:
+        return False
+    
+    response = f"Here are the details for all {len(products)} products:\n\n"
+    
+    for i, doc in enumerate(products, 1):
+        meta = doc.metadata or {}
+        pn = meta.get("product_number", "Unknown")
+        
+        content_lines = doc.page_content.split('\n')
+        
+        response += f"**{i}. {pn}**\n"
+        
+        spec_count = 0
+        for line in content_lines[1:]:
+            if line.strip() and spec_count < 10:
+                response += f"- {line.strip()}\n"
+                spec_count += 1
+        
+        response += "\n"
+    
+    response += "Let me know if you'd like to know anything specific about any of these products!"
+    
+    show_response(response)
+    return True
+
+def extract_requested_quantity(prompt: str) -> int | None:
+    """
+    Extract requested quantity from user prompt.
+    Returns: int (1-15) or None if not specified
+    Examples:
+    - "show me 1 docking station" -> 1
+    - "I need 3 cables" -> 3
+    - "I want 5 adapters" -> 5
+    - "show me docking stations" -> None (show multiple)
+    """
+    p_lower = prompt.lower()
+    
+    # Pattern 1: "show/find/get/give me X" OR "I need/want X"
+    m = re.search(r'\b(?:(?:show|find|get|give)\s+me|i\s+(?:need|want))\s+(\d+)\b', p_lower)
+    if m:
+        qty = int(m.group(1))
+        return min(qty, 15)  # Cap at 15
+    
+    # Pattern 2: "1/2/3 [product]" at start
+    m = re.search(r'^\s*(\d+)\s+\w+', p_lower)
+    if m:
+        qty = int(m.group(1))
+        return min(qty, 15)
+    
+    # Pattern 3: "a [product]" or "an [product]" (singular)
+    if re.search(r'\b(?:show|find|get|give)\s+me\s+(?:a|an)\s+\w+\b', p_lower):
+        return 1
+    
+    # Pattern 4: Word numbers ("one", "two", "three", etc.)
+    number_words = {
+        "one": 1, "two": 2, "three": 3, "four": 4, "five": 5,
+        "six": 6, "seven": 7, "eight": 8, "nine": 9, "ten": 10,
+        "eleven": 11, "twelve": 12, "thirteen": 13, "fourteen": 14, "fifteen": 15
+    }
+    
+    for word, num in number_words.items():
+        if re.search(rf'\b{word}\b', p_lower):
+            return num
+    
+    return None  # No specific quantity requested
+
 def _extract_explicit_port_counts(prompt: str) -> dict:
     """
-    Returns dict like {"usb_c_ports": {"$eq": 4}, "hdmi_ports": {"$eq": 2}}
+    Returns dict like {"usb_c_ports": {"$gte": 3}, "hdmi_ports": {"$eq": 2}}
     when the prompt contains explicit counts near a connector term.
-    Handles "4x usb-c", "usb-c x4", "2 hdmi", "hdmi 2", etc.
+    
+    CONTEXT-AWARE: Only extracts numbers when there's clear port context
+    (multipliers, "ports" keyword, or explicit listing format).
+    
+    Avoids extracting from:
+    - Model numbers (P2725HE, Dell 27)
+    - Version numbers (DP 1.4, HDMI 2.1)
+    - Other irrelevant numeric data
     """
     s = prompt.lower()
     out = {}
 
     for key, term in _EXPL_PORT_PATTERNS.items():
-        # 4x usb-c  |  usb-c x4  |  2 usb-c  |  usb-c 2
+        has_at_least = bool(re.search(
+            rf'(?:at\s*least|atleast|minimum|min|at\s+least)\s+\d+.*?(?:{term})', 
+            s, 
+            flags=re.I
+        ))
+        
         pats = [
             rf"\b(\d+)\s*[x×]\s*(?:{term})\b",
             rf"\b(?:{term})\s*[x×]\s*(\d+)\b",
-            rf"\b(\d+)\s*(?:{term})\b",
-            rf"\b(?:{term})\s*(\d+)\b",
+            rf"\b(\d+)\s*(?:{term})\s+ports?\b",
+            rf"\b(?:{term})\s+ports?\s*[:\-]?\s*(\d+)",
+            rf"\b(?:{term})\s*[:\-]\s*(\d+)\b",
+            rf"\b(\d+)\s+(?:{term})(?!\s*[\d\.])",
         ]
+        
         best = None
         for p in pats:
             m = re.search(p, s, flags=re.I)
             if m:
                 try:
-                    best = max(int(m.group(1)), best or 0)
+                    num = int(m.group(1))
+                    if 1 <= num <= 12:
+                        best = max(num, best or 0)
                 except:
                     pass
+        
         if best:
-            out[key] = {"$eq": float(best)}
+            if has_at_least:
+                out[key] = {"$gte": float(best)}
+            else:
+                out[key] = {"$eq": float(best)}
+    
     return out
 
 def extract_filter_from_prompt(prompt):
@@ -1248,6 +1411,34 @@ def extract_filter_from_prompt(prompt):
                 if not filters["subcategory"]["$in"]:
                     filters.pop("subcategory", None)
 
+    # ========== NEW: Daisy-Chain Detection ==========
+    if detect_daisy_chain_intent(prompt):
+        print("🔗 DEBUG: Daisy-chain intent detected! Biasing toward DisplayPort cables...")
+        
+        # Force DisplayPort connectors (both ends same for daisy-chaining)
+        filters["interfacea_type"] = "displayport"
+        filters["interfaceb_type"] = "displayport"
+        
+        # Store flag for educational response
+        st.session_state.daisy_chain_query = True
+        
+        # Ensure cable categories
+        all_cats = categorical_values.get("category", [])
+        cable_cats = [
+            norm_text(c) for c in all_cats 
+            if any(keyword in norm_text(c) for keyword in ["cable", "display", "video"])
+        ]
+        if cable_cats:
+            filters["category"] = {"$in": cable_cats}
+        
+        # Remove subcategory to broaden search
+        filters.pop("subcategory", None)
+        
+        print(f"🔗 DEBUG: Applied DisplayPort bias filters: {filters}")
+    else:
+        st.session_state.daisy_chain_query = False
+    # ================================================
+
     # Store filters for logging
     st.session_state.last_filters_applied = filters
     
@@ -1420,12 +1611,23 @@ def _score_product_simplicity(metadata: dict) -> float:
     
     return 0.7  # neutral
 
-def _should_show_multiple_products(prompt: str, num_matches: int) -> bool:
+def _should_show_multiple_products(prompt: str, num_matches: int) -> tuple[bool, int]:
     """
-    Determine if we should show multiple products instead of just one.
+    Determine if we should show multiple products and how many.
+    Returns: (show_multiple: bool, quantity: int)
     """
+    # Check if user requested specific quantity
+    requested_qty = extract_requested_quantity(prompt)
+    
+    if requested_qty is not None:
+        if requested_qty == 1:
+            return (False, 1)  # Show single product with full details
+        else:
+            return (True, requested_qty)  # Show exact quantity requested
+    
+    # No specific quantity requested - use exploratory logic
     if num_matches < 3:
-        return False
+        return (False, 1)
     
     p_lower = prompt.lower()
     
@@ -1437,28 +1639,38 @@ def _should_show_multiple_products(prompt: str, num_matches: int) -> bool:
     ]
     
     if any(phrase in p_lower for phrase in exploratory_phrases):
-        return True
+        return (True, 5)  # Default to 5 for exploratory queries
     
     # If query is very short and vague (3 words or less)
     words = [w for w in prompt.split() if w.lower() not in _STOPWORDS]
     if len(words) <= 3:
-        return True
+        return (True, 5)
     
-    return False
+    return (False, 1)
 
-def _build_multi_product_response(products: list, prompt: str) -> str:
+def _build_multi_product_response(products: list, prompt: str, quantity: int = 5) -> str:
     """
-    Build a response showing multiple products (3-5 max).
+    Build a response showing multiple products (2-15 max).
     Returns formatted markdown with product summaries.
     Also stores product info in session state for logging.
     """
-    # Limit to top 5
-    products = products[:5]
+    # Cap at requested quantity or 15 max
+    max_to_show = min(quantity, 15, len(products))
+    products = products[:max_to_show]
+    
+    # Store full product documents for follow-up queries
+    st.session_state.last_multi_products = products
     
     # NEW: Store products for logging
     products_for_logging = []
     
-    response = f"I found {len(products)} products that match your search:\n\n"
+    # ========== NEW: Educational response for daisy-chain queries ==========
+    response = ""
+    if st.session_state.get('daisy_chain_query'):
+        response += "**ℹ️ For daisy-chaining monitors, you'll need DisplayPort cables (not HDMI).** HDMI doesn't support daisy-chaining multiple monitors. DisplayPort 1.2 or higher with MST (Multi-Stream Transport) is required for this setup.\n\n"
+    # =======================================================================
+    
+    response += f"I found {len(products)} products that match your search:\n\n"
     
     for i, doc in enumerate(products, 1):
         meta = doc.metadata or {}
@@ -1497,6 +1709,10 @@ def _build_multi_product_response(products: list, prompt: str) -> str:
                 response += f"- {spec}\n"
         response += "\n"
     
+    # Add footer with limit notice if applicable
+    if len(products) >= 15:
+        response += "\n*Note: Showing maximum of 15 products. You can narrow your search for more specific results.*\n\n"
+    
     response += "Would you like detailed specs on any of these? Just let me know the product number!"
     
     # NEW: Store in session state for logging
@@ -1504,49 +1720,278 @@ def _build_multi_product_response(products: list, prompt: str) -> str:
     
     return response
 
+# -------------------- Meta-Query Detection --------------------
+def detect_meta_query(prompt: str) -> dict | None:
+    """
+    Detects catalog information queries (not product search queries).
+    
+    Examples:
+    - "How many cables do you sell?"
+    - "What types of docking stations do you have?"
+    - "Do you sell KVM switches?"
+    
+    Returns: {"type": "count", "filter": {...}} or None
+    """
+    p_lower = prompt.lower()
+    p_norm = norm_text(prompt)
+    
+    # Pattern 1: "How many [product type] do you sell/have/offer?"
+    how_many_patterns = [
+        r'\bhow\s+many\b',
+        r'\bhow\s+much\b',
+        r'\bnumber\s+of\b',
+    ]
+    
+    if any(re.search(pat, p_lower) for pat in how_many_patterns):
+        # Extract filters from the query
+        filters = extract_filter_from_prompt(prompt)
+        return {"type": "count", "filters": filters}
+    
+    # Pattern 2: "What types/kinds of [product] do you have/sell/offer?"
+    what_types_patterns = [
+        r'\bwhat\s+(?:types?|kinds?)\s+of\b',
+        r'\bwhat\s+(?:types?|kinds?)\b',
+        r'\bwhat\s+.*\s+do\s+you\s+(?:have|sell|offer|carry)\b',
+    ]
+    
+    if any(re.search(pat, p_lower) for pat in what_types_patterns):
+        filters = extract_filter_from_prompt(prompt)
+        return {"type": "catalog_info", "filters": filters}
+    
+    # Pattern 3: "Do you sell/have/offer [product]?"
+    do_you_patterns = [
+        r'\bdo\s+you\s+(?:sell|have|offer|carry|stock)\b',
+        r'\bdoes\s+(?:startech|your\s+company)\s+(?:sell|have|offer|carry)\b',
+    ]
+    
+    if any(re.search(pat, p_lower) for pat in do_you_patterns):
+        filters = extract_filter_from_prompt(prompt)
+        return {"type": "availability", "filters": filters}
+    
+    return None
+
+def handle_meta_query(prompt: str, meta_info: dict) -> bool:
+    """
+    Handles catalog information queries by counting products and responding naturally.
+    Returns True if handled, False otherwise.
+    """
+    query_type = meta_info.get("type")
+    filters = meta_info.get("filters") or {}
+    
+    # Count products using cascading search
+    docs = _cascading_search(prompt, filters, vector_store)
+    count = len(docs)
+    
+    # Store for logging
+    st.session_state.results_count = count
+    
+    # Determine category description (prioritize subcategory for specificity)
+    category_desc = "products"
+    
+    if filters:
+        # Try subcategory first (more specific)
+        if "subcategory" in filters:
+            subs = filters["subcategory"]
+            if isinstance(subs, dict) and "$in" in subs:
+                sub_list = subs["$in"]
+                if len(sub_list) == 1:
+                    category_desc = sub_list[0].replace("-", " ").title()
+                elif len(sub_list) <= 3:
+                    # NEW: Show only primary subcategory with "and related"
+                    primary = sub_list[0].replace("-", " ").title()
+                    category_desc = f"{primary} and related"
+                else:
+                    # Extract primary category from subcategories
+                    primary = sub_list[0].replace("-", " ").title()
+                    category_desc = f"{primary} and related"
+        
+        # Fallback to category if no subcategory
+        elif "category" in filters:
+            cats = filters["category"]
+            if isinstance(cats, dict) and "$in" in cats:
+                cat_list = cats["$in"]
+                if len(cat_list) == 1:
+                    category_desc = cat_list[0].replace("-", " ").title()
+                elif len(cat_list) <= 3:
+                    # NEW: Show only primary category with "and related"
+                    primary = cat_list[0].replace("-", " ").title()
+                    category_desc = f"{primary} and related"
+                else:
+                    # Extract primary category
+                    primary = cat_list[0].replace("-", " ").title()
+                    category_desc = f"{primary} and related categories"
+    
+    # Helper to avoid redundant "products" in response
+    def format_response(count_text, desc):
+        # If desc already ends with "products" or "categories", don't add "products" again
+        if desc.endswith(("products", "categories", "related")):
+            return f"StarTech.com offers {count_text} {desc}"
+        else:
+            return f"StarTech.com offers {count_text} {desc} products"
+    
+    # Generate response based on query type
+    if query_type == "count":
+        if count == 0:
+            response = f"I couldn't find any {category_desc} matching those specifications. Could you try adjusting your search?"
+        elif count == 1:
+            response = format_response("1", category_desc) + ". Would you like to see the details?"
+        elif count <= 5:
+            response = format_response(str(count), category_desc) + ". Would you like to see them?"
+        elif count <= 20:
+            response = format_response(str(count), category_desc) + ". Would you like to see some options, or would you like to narrow down your search?"
+        else:
+            response = format_response(f"over {count}", category_desc) + ". Would you like to narrow down your search to see specific types?"
+    
+    elif query_type == "catalog_info":
+        if count == 0:
+            response = f"I couldn't find specific types of {category_desc}. Could you rephrase your question?"
+        else:
+            # Extract unique subcategories from results
+            subcats = set()
+            for doc in docs[:20]:  # Sample first 20
+                subcat = doc.metadata.get("subcategory")
+                if subcat:
+                    subcats.add(subcat.title())
+            
+            if subcats and len(subcats) <= 10:
+                subcat_list = ", ".join(sorted(subcats))
+                response = f"StarTech.com offers {category_desc} including: {subcat_list}. Would you like to see products in any of these categories?"
+            else:
+                response = f"StarTech.com offers a wide variety of {category_desc}. Would you like to search for a specific type?"
+    
+    elif query_type == "availability":
+        if count == 0:
+            response = f"I couldn't find {category_desc} matching those specifications. Could you try a different search?"
+        elif count == 1:
+            response = f"Yes! StarTech.com offers a {category_desc} product. Would you like to see the details?"
+        else:
+            response = f"Yes! StarTech.com offers {count} {category_desc} products. Would you like to see some options?"
+    
+    else:
+        return False
+    
+    show_response(response)
+    return True
+
+# -------------------- Waterfall Search Strategy --------------------
+def _try_search(vector_store, filters: dict) -> list:
+    """
+    Safely attempt a metadata-filtered search.
+    Returns list of documents or empty list if search fails.
+    """
+    try:
+        if not filters:
+            return []
+        docs = vector_store.similarity_search("product spec", k=50, filter=filters)
+        return docs if docs else []
+    except Exception as e:
+        print(f"⚠️ Search failed with filters {filters}: {e}")
+        return []
+
+def _cascading_search(prompt: str, filters: dict, vector_store) -> list:
+    """
+    Progressive filter relaxation strategy (5 tiers).
+    Returns list of documents, trying increasingly relaxed filters.
+    """
+    if not filters:
+        # No filters to relax, go straight to semantic search
+        print("⚠️ No filters extracted, falling back to semantic search")
+        results = vector_store.similarity_search_with_relevance_scores(prompt, k=12)
+        return [doc for doc, score in results if score >= 0.35]
+    
+    # Define filter tier groups
+    tier1_critical = {"interfacea_type", "interfaceb_type", "category"}
+    
+    tier2_important = {
+        "subcategory", "cablelength", "ports", "displays", 
+        "packqty", "numharddrive", "usb_c_ports", 
+        "usb_a_ports", "hdmi_ports", "dp_ports", "vga_ports", "interface"
+    }
+    
+    tier3_aesthetics = {
+        "color", "material", "wireless", "fiberduplex", 
+        "fibertype", "mounting_options"
+    }
+    
+    # Material tags (mtag_*)
+    tier3_material_tags = {k for k in filters.keys() if k.startswith("mtag_")}
+    
+    # Tier 1: Try ALL filters
+    docs = _try_search(vector_store, filters)
+    if docs:
+        print(f"✅ Tier 1 success: Found {len(docs)} products with ALL filters")
+        return docs
+    
+    # Tier 2: Remove Tier 3 filters (aesthetics + material tags)
+    tier2_filters = {
+        k: v for k, v in filters.items() 
+        if k not in (tier3_aesthetics | tier3_material_tags)
+    }
+    if tier2_filters != filters:  # Only try if filters changed
+        docs = _try_search(vector_store, tier2_filters)
+        if docs:
+            print(f"✅ Tier 2 success: Found {len(docs)} products (dropped aesthetics)")
+            return docs
+    
+    # Tier 3: Remove subcategory + interface
+    tier3_filters = {
+        k: v for k, v in tier2_filters.items() 
+        if k not in {"subcategory", "interface"}
+    }
+    if tier3_filters != tier2_filters:  # Only try if filters changed
+        docs = _try_search(vector_store, tier3_filters)
+        if docs:
+            print(f"✅ Tier 3 success: Found {len(docs)} products (dropped subcategory)")
+            return docs
+    
+    # Tier 4: Keep ONLY critical filters (connectors + category)
+    tier4_filters = {k: v for k, v in filters.items() if k in tier1_critical}
+    if tier4_filters:  # Only if we have critical filters
+        docs = _try_search(vector_store, tier4_filters)
+        if docs:
+            print(f"✅ Tier 4 success: Found {len(docs)} products (critical filters only)")
+            return docs
+    
+    # Tier 5: Semantic search only (no metadata filters)
+    print("⚠️ All filter tiers failed, falling back to semantic search")
+    results = vector_store.similarity_search_with_relevance_scores(prompt, k=12)
+    return [doc for doc, score in results if score >= 0.35]
+
 def handle_descriptive_query(prompt, f_override=None):
     f = f_override if f_override is not None else extract_filter_from_prompt(prompt)
     st.session_state.last_product_number = ""
     st.session_state.last_context = ""
     st.session_state.last_score = None
     st.session_state.last_metadata = {}
-    try:
-        if f:
-            docs = vector_store.similarity_search("product spec", k=50, filter=f)
-            
-            # Store results count for logging
-            st.session_state.results_count = len(docs) if docs else 0
-            
-            if docs:
-                # If we have connector filters, re-rank by simplicity
-                if "interfacea_type" in f or "interfaceb_type" in f:
-                    scored = [(doc, _score_product_simplicity(doc.metadata)) for doc in docs]
-                    scored.sort(key=lambda x: x[1], reverse=True)
-                    docs = [doc for doc, score in scored]
-                
-                # Check if we should show multiple products
-                if _should_show_multiple_products(prompt, len(docs)):
-                    multi_response = _build_multi_product_response(docs, prompt)
-                    show_response(multi_response)
-                    return True
-                
-                return use_top_result([(docs[0], 1.0)])
-    except Exception as e:
-        print(f"Metadata-filtered search failed: {e}")
-
-    results = vector_store.similarity_search_with_relevance_scores(prompt, k=12)
-    results = [(doc, score) for doc, score in results if score >= 0.35]
-    if not results:
-        return False
-
-    if f:
-        for d, s in results:
-            if _satisfies_numeric(d.metadata or {}, f):
-                return use_top_result([(d, s)])
-        show_response("I couldn't find a product that meets that requirement. If you can adjust it, I'll try again.")
-        return "no-match"
-
-    return use_top_result(results)
+    st.session_state.last_multi_products = None
+    
+    # Use cascading search with progressive filter relaxation
+    docs = _cascading_search(prompt, f, vector_store)
+    
+    # Store results count for logging
+    st.session_state.results_count = len(docs) if docs else 0
+    
+    if docs:
+        # If we have connector filters, re-rank by simplicity
+        if f and ("interfacea_type" in f or "interfaceb_type" in f):
+            scored = [(doc, _score_product_simplicity(doc.metadata)) for doc in docs]
+            scored.sort(key=lambda x: x[1], reverse=True)
+            docs = [doc for doc, score in scored]
+        
+        # Check if we should show multiple products and how many
+        show_multiple, quantity = _should_show_multiple_products(prompt, len(docs))
+        
+        if show_multiple:
+            multi_response = _build_multi_product_response(docs, prompt, quantity)
+            show_response(multi_response)
+            return True
+        
+        # Single product requested - show full details
+        return use_top_result([(docs[0], 1.0)])
+    
+    # If cascading search returned nothing, show "couldn't find" message
+    show_response("I couldn't find a product that meets those requirements. Could you try adjusting your search? For example, you could be less specific about length, color, or other preferences.")
+    return "no-match"
 
 def use_top_result(results):
     top_doc, score = results[0]
@@ -1674,11 +2119,48 @@ if prompt:
     with st.chat_message("user"):
         st.markdown(prompt)
 
+    # ========== DEBUG BLOCK ==========
+    print("\n" + "="*60)
+    print("🔍 DEBUG: New Query Processing")
+    print("="*60)
+    print(f"User Query: {prompt}")
+    print(f"Last Product Number: {st.session_state.get('last_product_number', 'None')}")
+    print(f"Last Metadata Keys: {list(st.session_state.get('last_metadata', {}).keys())}")
+    
+    # Check what is_vague_follow_up thinks
+    vague = is_vague_follow_up(prompt)
+    print(f"is_vague_follow_up(): {vague}")
+    
+    # Check what _looks_like_new_product_query thinks
+    p_norm = norm_text(prompt)
+    new_search = _looks_like_new_product_query(p_norm)
+    print(f"_looks_like_new_product_query(): {new_search}")
+    
+    # Check anchor detection
+    anchor = detect_anchor_rules(p_norm)
+    print(f"Anchor detected: {anchor}")
+    
+    print("="*60 + "\n")
+    # ========== END DEBUG BLOCK ==========
+
     if handle_install_block(prompt): st.stop()
     if handle_greeting(prompt) or handle_farewell(prompt): st.stop()
 
+    # ====== NEW: Check for meta-queries BEFORE product search ======
+    meta_query_info = detect_meta_query(prompt)
+    if meta_query_info:
+        if handle_meta_query(prompt, meta_query_info):
+            st.stop()
+    # ================================================================
+
     handled = handle_explicit_product(prompt)
     if not handled:
+        # ====== NEW: Handle multi-product follow-up queries ======
+        if detect_multi_product_followup(prompt):
+            if handle_multi_product_followup(prompt):
+                st.stop()
+        # ==========================================================
+        
         # ====== NEW: treat clarification as follow-up on current SKU ======
         if is_clarifying_followup(prompt):
             if not st.session_state.last_context:

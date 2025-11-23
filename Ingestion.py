@@ -609,8 +609,14 @@ def build_metadata(row):
         connector_a = str(row["INTERFACEA"]).strip().lower()
         if connector_a:
             meta["interfacea_full"] = connector_a
-            # Extract just the connector type (vga, hdmi, dvi, displayport, usb)
-            if "vga" in connector_a:
+            # Extract connector type - CHECK USB FIRST (before DisplayPort Alt Mode confusion)
+            if "usb-c" in connector_a or "usbc" in connector_a or "type-c" in connector_a or "type c" in connector_a:
+                meta["interfacea_type"] = "usb-c"
+            elif "usb-a" in connector_a or "usba" in connector_a or "type-a" in connector_a or "type a" in connector_a:
+                meta["interfacea_type"] = "usb-a"
+            elif "usb" in connector_a:
+                meta["interfacea_type"] = "usb"
+            elif "vga" in connector_a:
                 meta["interfacea_type"] = "vga"
             elif "hdmi" in connector_a:
                 meta["interfacea_type"] = "hdmi"
@@ -618,18 +624,19 @@ def build_metadata(row):
                 meta["interfacea_type"] = "dvi"
             elif "displayport" in connector_a or "display port" in connector_a:
                 meta["interfacea_type"] = "displayport"
-            elif "usb" in connector_a:
-                if "usb-c" in connector_a or "usbc" in connector_a or "type-c" in connector_a or "type c" in connector_a:
-                    meta["interfacea_type"] = "usb-c"
-                else:
-                    meta["interfacea_type"] = "usb"
 
     if "INTERFACEB" in row and pd.notna(row.get("INTERFACEB")):
         connector_b = str(row["INTERFACEB"]).strip().lower()
         if connector_b:
             meta["interfaceb_full"] = connector_b
-            # Extract just the connector type
-            if "vga" in connector_b:
+            # Extract connector type - CHECK USB FIRST (before DisplayPort Alt Mode confusion)
+            if "usb-c" in connector_b or "usbc" in connector_b or "type-c" in connector_b or "type c" in connector_b:
+                meta["interfaceb_type"] = "usb-c"
+            elif "usb-a" in connector_b or "usba" in connector_b or "type-a" in connector_b or "type a" in connector_b:
+                meta["interfaceb_type"] = "usb-a"
+            elif "usb" in connector_b:
+                meta["interfaceb_type"] = "usb"
+            elif "vga" in connector_b:
                 meta["interfaceb_type"] = "vga"
             elif "hdmi" in connector_b:
                 meta["interfaceb_type"] = "hdmi"
@@ -637,11 +644,7 @@ def build_metadata(row):
                 meta["interfaceb_type"] = "dvi"
             elif "displayport" in connector_b or "display port" in connector_b:
                 meta["interfaceb_type"] = "displayport"
-            elif "usb" in connector_b:
-                if "usb-c" in connector_b or "usbc" in connector_b or "type-c" in connector_b or "type c" in connector_b:
-                    meta["interfaceb_type"] = "usb-c"
-                else:
-                    meta["interfaceb_type"] = "usb"
+
     # derived: per-connector port counts from multiple text columns
     text_sources = [row.get("CONNTYPE"), row.get("EXTERNALPORTS"), row.get("HOSTCONNECTOR")]
     for key, rx in PORT_PATTERNS.items():
