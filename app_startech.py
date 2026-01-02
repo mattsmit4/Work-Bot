@@ -33,7 +33,7 @@ from ui.logging import ConversationLogger
 # CONFIGURATION
 # =============================================================================
 
-DEBUG_MODE = True  # Set to False for production (customer-facing)
+DEBUG_MODE = False  # Set to True for development debugging
 
 # Initialize structured logging
 setup_logging(

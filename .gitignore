@@ -64,8 +64,7 @@ conversation_logs.csv
 *.db
 *.sqlite
 
-# Excel data files
-*.xlsx
+# Note: Main Data AI Bot.xlsx is tracked for Streamlit Cloud deployment
 
 # Archive folder
 _archive/
