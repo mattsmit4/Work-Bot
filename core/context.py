@@ -607,6 +607,7 @@ class SearchFilters:
         color: Requested product color (e.g., "Black", "White", "Red")
         keywords: Search keywords for text matching (e.g., ["fiber", "optic", "patch"])
         required_port_types: Port types the product must have (e.g., ["USB-C"] for docks)
+        min_monitors: Minimum number of monitors the dock must support
     """
     length: Optional[float] = None
     length_unit: Optional[str] = None
@@ -619,3 +620,4 @@ class SearchFilters:
     color: Optional[str] = None
     keywords: list[str] = field(default_factory=list)
     required_port_types: list[str] = field(default_factory=list)
+    min_monitors: Optional[int] = None

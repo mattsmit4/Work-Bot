@@ -132,8 +132,10 @@ class FilterExtractor:
                                    'hdd enclosure', 'nvme enclosure', 'm.2 enclosure'],
             # Privacy screens/filters
             'privacy screens': ['privacy screen', 'privacy filter', 'screen filter'],
-            # Server racks
-            'server racks': ['server rack', 'rack', 'racks', 'equipment rack', '19 inch rack'],
+            # Server racks - require specific terms, not just bare "rack" which could be
+            # contextual (e.g., "patch panel for rack" is about patch panels, not racks)
+            'server racks': ['server rack', 'equipment rack', '19 inch rack', '42u rack',
+                             'data rack', 'network rack', 'rack cabinet', 'rack enclosure'],
             # Computer/expansion cards
             'computer cards': ['pci card', 'expansion card', 'pcie card', 'network card', 'video card'],
             # Video splitters (before generic 'splitters')
@@ -141,7 +143,9 @@ class FilterExtractor:
             # Multiport adapters (before generic 'adapters')
             'multiport adapters': ['multiport adapter', 'multiport', 'multi-port adapter', 'multi port adapter'],
             # General categories
-            'cables': ['cable', 'cables', 'cord', 'cords'],
+            # Cables includes network cable types (cat5, cat6, patch cable)
+            'cables': ['cable', 'cables', 'cord', 'cords', 'cat6', 'cat5e', 'cat5',
+                       'cat6a', 'cat7', 'patch cable', 'ethernet cable'],
             'adapters': ['adapter', 'adapters', 'converter', 'converters'],
             'docks': ['dock', 'docking', 'docking station'],
             'hubs': ['hub', 'hubs'],
@@ -181,6 +185,7 @@ class FilterExtractor:
         """
         query_lower = query.lower()
         query_expanded = expand_synonyms(query)
+        query_expanded_lower = query_expanded.lower()
 
         # Extract category FIRST - affects how we interpret connectors
         category = self._extract_category(query_lower)
@@ -192,6 +197,8 @@ class FilterExtractor:
         features = self._extract_features(query_lower)
         port_count = self._extract_port_count(query_lower)
         color = self._extract_color(query_lower)
+        # Use expanded query for monitor extraction (handles typos like "moinitors")
+        min_monitors = self._extract_min_monitors(query_expanded_lower)
 
         # Special handling for multiport adapters (MUST come before NON_CABLE_CATEGORIES)
         # Multiport adapters have ONE input (e.g., USB-C) but MULTIPLE DIFFERENT output types
@@ -235,6 +242,7 @@ class FilterExtractor:
             color=color,
             keywords=keywords,
             required_port_types=required_port_types,
+            min_monitors=min_monitors,
         )
     
     # === Length Extraction ===
@@ -563,6 +571,46 @@ class FilterExtractor:
 
         # Pattern 2: "with X ports" (e.g., "switch with 8 ports")
         match = re.search(r'\bwith\s+(\d+)\s+ports?\b', text)
+        if match:
+            return int(match.group(1))
+
+        return None
+
+    # === Monitor Count Extraction ===
+
+    def _extract_min_monitors(self, text: str) -> Optional[int]:
+        """
+        Extract minimum monitor count requirement from text.
+
+        Args:
+            text: Query text (lowercased)
+
+        Returns:
+            Minimum monitor count as integer, or None if not specified
+
+        Examples:
+            "dock that supports 3 monitors" → 3
+            "dual monitor dock" → 2
+            "triple monitor setup" → 3
+            "dock for 2 displays" → 2
+        """
+        # Pattern 1: Named counts (dual, triple, quad)
+        named_counts = {
+            'dual': 2, 'double': 2, 'two': 2,
+            'triple': 3, 'three': 3,
+            'quad': 4, 'four': 4,
+        }
+        for name, count in named_counts.items():
+            if re.search(rf'\b{name}\b', text):
+                return count
+
+        # Pattern 2: Numeric with "monitor" or "display" (e.g., "3 monitors", "2 displays")
+        match = re.search(r'\b(\d+)\s*(?:monitors?|displays?)\b', text)
+        if match:
+            return int(match.group(1))
+
+        # Pattern 3: "support/supports X monitors" (e.g., "supports 3 monitors")
+        match = re.search(r'\bsupports?\s+(\d+)\s*(?:monitors?|displays?)\b', text)
         if match:
             return int(match.group(1))
 
