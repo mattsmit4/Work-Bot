@@ -378,6 +378,11 @@ class FollowupHandler(BaseHandler):
         if 'sd card' in query_lower:
             keywords.append('SD card')
 
+        # Colors
+        color_match = re.search(r'\b(black|white|gray|grey|silver|blue|red|green)\b', query_lower)
+        if color_match:
+            keywords.append(f'color:{color_match.group(1)}')
+
         return list(set(keywords))
 
     def _score_by_requirements(self, product, requirements: list) -> int:
@@ -396,6 +401,19 @@ class FollowupHandler(BaseHandler):
                 if product.supports_4k():
                     score += 1
                 continue  # Skip text matching for 4K - it's a specific technical check
+
+            # Color check - handles "color:black", "color:white", etc.
+            if req_lower.startswith('color:'):
+                color = req_lower.split(':', 1)[1]
+                # Check metadata color field
+                product_color = meta.get('color', '').lower()
+                if color in product_color:
+                    score += 1
+                    continue
+                # Also check in product name/content for color
+                if color in content_lower:
+                    score += 1
+                continue
 
             # Dock-specific checks
             if meta.get('category') in ('dock', 'hub'):

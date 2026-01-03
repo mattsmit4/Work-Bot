@@ -39,6 +39,17 @@ class NewSearchHandler(BaseHandler):
                 f"{original_count} → {len(results.products)} products"
             )
 
+        # Apply monitor count filtering for docks
+        if filters.min_monitors:
+            original_count = len(results.products)
+            results.products = self._filter_by_monitor_count(
+                results.products, filters.min_monitors
+            )
+            ctx.add_debug(
+                f"🔍 MONITOR FILTER: min {filters.min_monitors} → "
+                f"{original_count} → {len(results.products)} products"
+            )
+
         if not results.products:
             # Try fallback searches
             return self._handle_no_results(ctx, filters)
@@ -72,9 +83,22 @@ class NewSearchHandler(BaseHandler):
         )
 
         top_products = [rp.product for rp in ranked_products]
+
+        # Build filters dict for logging
+        filters_for_log = {
+            'category': filters.product_category,
+            'connector_from': filters.connector_from,
+            'connector_to': filters.connector_to,
+            'length': filters.length,
+            'length_unit': getattr(filters, 'length_unit', 'ft'),
+            'features': filters.features or [],
+        }
+
         return HandlerResult(
             response=response,
-            products_to_set=top_products
+            products_to_set=top_products,
+            filters_for_logging=filters_for_log,
+            products_found=len(results.products)
         )
 
     def _handle_no_results(self, ctx: HandlerContext, filters: SearchFilters) -> HandlerResult:
@@ -227,6 +251,38 @@ class NewSearchHandler(BaseHandler):
                 return False
 
         return True
+
+    def _filter_by_monitor_count(
+        self,
+        products: list[Product],
+        min_monitors: int
+    ) -> list[Product]:
+        """
+        Filter products to only those that support at least min_monitors.
+
+        Args:
+            products: List of products to filter
+            min_monitors: Minimum number of monitors the dock must support
+
+        Returns:
+            Filtered list of products that support at least min_monitors
+        """
+        if not min_monitors:
+            return products
+
+        filtered = []
+        for product in products:
+            # Get monitor count from DOCKNUMDISPLAYS metadata field
+            num_displays = product.metadata.get('DOCKNUMDISPLAYS')
+            if num_displays:
+                try:
+                    num_displays = int(float(num_displays))
+                    if num_displays >= min_monitors:
+                        filtered.append(product)
+                except (ValueError, TypeError):
+                    pass
+
+        return filtered
 
     def _handle_sku_lookup(self, ctx: HandlerContext, sku: str) -> HandlerResult:
         """

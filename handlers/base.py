@@ -64,6 +64,7 @@ class HandlerResult:
     - Products to set in context
     - Whether to save guidance state
     - Whether to save pending question state
+    - Extracted filters (for logging)
     """
     response: str
     products_to_set: Optional[List[Product]] = None
@@ -71,6 +72,10 @@ class HandlerResult:
     save_pending_question: bool = False
     clear_guidance: bool = False
     clear_pending_question: bool = False
+    # For logging - extracted search filters (optional)
+    filters_for_logging: Optional[dict] = None
+    # For logging - total products found before filtering to top N
+    products_found: int = 0
 
 
 class BaseHandler(ABC):
