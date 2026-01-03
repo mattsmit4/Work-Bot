@@ -53,8 +53,8 @@ htmlcov/
 # Logging
 logs/
 
-# Streamlit
-.streamlit/
+# Streamlit secrets (keep .example, ignore actual secrets)
+.streamlit/secrets.toml
 
 # Data (keep structure, ignore content)
 conversations.csv

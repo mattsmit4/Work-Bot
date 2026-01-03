@@ -63,13 +63,23 @@ class JSONFormatter(logging.Formatter):
         # Add extra fields from record
         # These are passed via logger.info("msg", extra={...})
         extra_fields = [
-            "event", "session_id", "query", "intent", "confidence",
-            "filters", "products_found", "response_time_ms", "tier",
-            "dropped_filters", "error_type", "stack_trace", "user_id",
-            "llm_model", "llm_tokens", "llm_latency_ms", "products_shown",
-            "product_skus", "search_latency_ms", "filter_extraction_ms",
-            "intent_classification_ms", "total_latency_ms", "category",
-            "connector_from", "connector_to", "length", "features",
+            # Core conversation fields (new)
+            "event", "session_id", "user_query", "intent_result", "intent_confidence",
+            # Legacy names (for backwards compatibility)
+            "query", "intent", "confidence",
+            # Filter and search fields
+            "filters", "products_found", "products_shown", "product_skus",
+            "response_time_ms", "tier", "dropped_filters",
+            # Error tracking
+            "error_type", "stack_trace", "user_id",
+            # LLM metrics
+            "llm_model", "llm_tokens", "llm_latency_ms",
+            # Performance timing
+            "search_latency_ms", "filter_extraction_ms",
+            "intent_classification_ms", "total_latency_ms",
+            # Filter details
+            "category", "connector_from", "connector_to", "length", "features",
+            # Misc
             "reasoning", "match_quality", "port_count", "setup_type",
             "guidance_phase", "api_endpoint", "status_code", "request_id",
         ]
@@ -134,6 +144,169 @@ class ConsoleFormatter(logging.Formatter):
 
 
 # =============================================================================
+# CSV Handler for Power BI
+# =============================================================================
+
+class CSVHandler(logging.Handler):
+    """
+    Custom handler that writes log records to CSV files.
+
+    Creates daily rotating CSV files in logs/csv/ directory.
+    Ideal for Power BI and Excel analysis.
+    """
+
+    # Standard CSV columns (order matters for Power BI)
+    # Priority columns first for easy Power BI analysis
+    CSV_COLUMNS = [
+        # Core conversation data (most important for Power BI)
+        'timestamp', 'session_id', 'user_query', 'intent_result', 'intent_confidence',
+        # Event metadata
+        'level', 'logger', 'message', 'event',
+        # Search filters (flattened)
+        'filters_category', 'filters_connector_from', 'filters_connector_to',
+        'filters_length', 'filters_length_unit', 'filters_features',
+        # Results
+        'products_found', 'products_shown', 'product_skus',
+        # Performance metrics
+        'response_time_ms', 'search_latency_ms', 'llm_latency_ms',
+        # Legacy columns (for backwards compatibility with existing logs)
+        'query', 'intent', 'confidence', 'category', 'connector_from',
+        'connector_to', 'length', 'error_type', 'tier', 'filters'
+    ]
+
+    def __init__(self, log_dir: str = "logs"):
+        super().__init__()
+        self.log_dir = Path(log_dir) / "csv"
+        self.log_dir.mkdir(parents=True, exist_ok=True)
+        self.current_date = None
+        self.csv_file = None
+        self.csv_writer = None
+        self._file_handle = None
+
+    def _get_csv_path(self) -> Path:
+        """Get path for today's CSV file."""
+        date_str = datetime.now().strftime('%Y-%m-%d')
+        return self.log_dir / f"stbot-{date_str}.csv"
+
+    def _ensure_file_open(self):
+        """Ensure CSV file is open and has headers."""
+        today = datetime.now().date()
+
+        # Check if we need to rotate to new day
+        if self.current_date != today:
+            self._close_file()
+            self.current_date = today
+
+        if self._file_handle is None:
+            csv_path = self._get_csv_path()
+            file_exists = csv_path.exists()
+
+            self._file_handle = open(csv_path, 'a', newline='', encoding='utf-8')
+            self.csv_writer = None  # Will create with DictWriter
+
+            # Write header if new file
+            if not file_exists:
+                self._file_handle.write(','.join(self.CSV_COLUMNS) + '\n')
+                self._file_handle.flush()
+
+    def _close_file(self):
+        """Close current CSV file."""
+        if self._file_handle:
+            self._file_handle.close()
+            self._file_handle = None
+            self.csv_writer = None
+
+    def _flatten_value(self, value) -> str:
+        """Convert value to CSV-safe string."""
+        if value is None:
+            return ''
+        if isinstance(value, dict):
+            # Flatten dict to key=value pairs
+            return '; '.join(f"{k}={v}" for k, v in value.items() if v is not None)
+        if isinstance(value, list):
+            return ', '.join(str(v) for v in value)
+        return str(value)
+
+    def emit(self, record: logging.LogRecord):
+        """Write log record to CSV."""
+        try:
+            self._ensure_file_open()
+
+            # Build row from record
+            row = {
+                'timestamp': datetime.utcnow().isoformat() + 'Z',
+                'level': record.levelname,
+                'logger': record.name,
+                'message': record.getMessage(),
+            }
+
+            # Map new column names to record attributes
+            # New columns map to both new and legacy field names
+            column_mappings = {
+                'user_query': ['user_query', 'query'],  # Try new name first, fall back to legacy
+                'intent_result': ['intent_result', 'intent'],
+                'intent_confidence': ['intent_confidence', 'confidence'],
+                'product_skus': ['product_skus'],
+            }
+
+            # Add mapped fields
+            for col, attr_names in column_mappings.items():
+                for attr in attr_names:
+                    if hasattr(record, attr) and getattr(record, attr) is not None:
+                        row[col] = self._flatten_value(getattr(record, attr))
+                        break
+                else:
+                    row[col] = ''
+
+            # Handle flattened filter fields from 'filters' dict
+            filters = getattr(record, 'filters', None)
+            if isinstance(filters, dict):
+                row['filters_category'] = filters.get('category', '') or ''
+                row['filters_connector_from'] = filters.get('connector_from', '') or ''
+                row['filters_connector_to'] = filters.get('connector_to', '') or ''
+                row['filters_length'] = filters.get('length', '') or ''
+                row['filters_length_unit'] = filters.get('length_unit', '') or ''
+                features = filters.get('features', [])
+                row['filters_features'] = ', '.join(features) if features else ''
+
+            # Add remaining fields directly from record
+            direct_fields = [
+                'event', 'session_id', 'products_found', 'products_shown',
+                'response_time_ms', 'search_latency_ms', 'llm_latency_ms',
+                'query', 'intent', 'confidence', 'category', 'connector_from',
+                'connector_to', 'length', 'error_type', 'tier', 'filters'
+            ]
+            for col in direct_fields:
+                if col not in row and hasattr(record, col):
+                    row[col] = self._flatten_value(getattr(record, col))
+
+            # Fill missing columns with empty strings
+            for col in self.CSV_COLUMNS:
+                if col not in row:
+                    row[col] = ''
+
+            # Write as CSV line
+            values = [self._escape_csv(row.get(col, '')) for col in self.CSV_COLUMNS]
+            self._file_handle.write(','.join(values) + '\n')
+            self._file_handle.flush()
+
+        except Exception:
+            self.handleError(record)
+
+    def _escape_csv(self, value: str) -> str:
+        """Escape value for CSV (quote if contains comma, quote, or newline)."""
+        value = str(value) if value else ''
+        if ',' in value or '"' in value or '\n' in value:
+            return '"' + value.replace('"', '""') + '"'
+        return value
+
+    def close(self):
+        """Clean up handler."""
+        self._close_file()
+        super().close()
+
+
+# =============================================================================
 # Logger Setup
 # =============================================================================
 
@@ -147,6 +320,8 @@ def setup_logging(
     file_level: int = logging.DEBUG,
     enable_console: bool = True,
     enable_file: bool = True,
+    enable_csv: bool = True,
+    enable_error_log: bool = True,
 ) -> None:
     """
     Initialize the logging system.
@@ -154,6 +329,7 @@ def setup_logging(
     Creates:
     - logs/stbot.log (all logs, rotating daily, 30-day retention)
     - logs/errors.log (ERROR and above, rotating daily, 30-day retention)
+    - logs/csv/stbot-YYYY-MM-DD.csv (CSV for Power BI, daily)
     - Console output (if enabled)
 
     Args:
@@ -161,7 +337,9 @@ def setup_logging(
         console_level: Minimum level for console output
         file_level: Minimum level for file output
         enable_console: Whether to output to console
-        enable_file: Whether to write to files
+        enable_file: Whether to write to stbot.log (detailed logs)
+        enable_csv: Whether to write CSV files for Power BI
+        enable_error_log: Whether to write errors.log (ERROR and above)
     """
     global _initialized
     if _initialized:
@@ -200,7 +378,8 @@ def setup_logging(
         file_handler.suffix = "%Y-%m-%d"
         root_logger.addHandler(file_handler)
 
-        # Error log file (ERROR and above only)
+    # Error log file (ERROR and above only) - can be enabled independently
+    if enable_error_log:
         error_log_file = log_path / "errors.log"
         error_handler = TimedRotatingFileHandler(
             filename=str(error_log_file),
@@ -213,6 +392,12 @@ def setup_logging(
         error_handler.setFormatter(JSONFormatter())
         error_handler.suffix = "%Y-%m-%d"
         root_logger.addHandler(error_handler)
+
+    # CSV handler for Power BI (daily files in logs/csv/)
+    if enable_csv:
+        csv_handler = CSVHandler(log_dir=log_dir)
+        csv_handler.setLevel(logging.DEBUG)  # Capture all events
+        root_logger.addHandler(csv_handler)
 
     _initialized = True
 
@@ -231,9 +416,8 @@ def get_logger(name: str) -> logging.Logger:
         logger = get_logger(__name__)
         logger.info("Search started", extra={"query": "USB-C cable"})
     """
-    # Ensure logging is set up
-    if not _initialized:
-        setup_logging()
+    # Note: Don't auto-initialize here - let app.py control logging setup
+    # If logging isn't set up yet, logs will go to root logger (console only)
 
     # Create child logger under stbot namespace
     if name.startswith("stbot."):
@@ -624,6 +808,80 @@ def log_guidance(
             "session_id": session_id,
             "setup_type": setup_type,
             "guidance_phase": phase,
+            **extra
+        }
+    )
+
+
+def log_conversation_turn(
+    session_id: str,
+    user_query: str,
+    intent_result: str,
+    intent_confidence: float,
+    products_found: int = 0,
+    products_shown: int = 0,
+    product_skus: Optional[list] = None,
+    filters: Optional[Dict[str, Any]] = None,
+    response_time_ms: Optional[float] = None,
+    **extra
+) -> None:
+    """
+    Log a complete conversation turn with all context for Power BI analysis.
+
+    This is the primary log event for conversation analytics. It captures
+    everything about a single user interaction in one row.
+
+    Args:
+        session_id: Unique session identifier (persists across conversation)
+        user_query: The actual user message/question
+        intent_result: Classified intent type (new_search, followup, greeting, etc.)
+        intent_confidence: Intent classification confidence (0.0 to 1.0)
+        products_found: Total matching products from search
+        products_shown: Number of products displayed to user (usually top 3-5)
+        product_skus: List of SKUs shown to user (pipe-separated in CSV)
+        filters: Extracted search filters dict (category, connectors, length, etc.)
+        response_time_ms: Total response time in milliseconds
+        **extra: Additional fields to log
+
+    Example:
+        log_conversation_turn(
+            session_id="session_20260101_134318",
+            user_query="I need a 10ft HDMI cable",
+            intent_result="new_search",
+            intent_confidence=0.90,
+            products_found=142,
+            products_shown=3,
+            product_skus=["HDMM10M", "HDMI2-CABLE-4K60-10M", "HD2AP-10M"],
+            filters={"category": "Cables", "connector_from": "HDMI", "length": 10.0},
+            response_time_ms=450.5
+        )
+    """
+    logger = get_logger("conversation")
+
+    # Format product SKUs as pipe-separated string for CSV
+    skus_str = '|'.join(product_skus) if product_skus else ''
+
+    logger.info(
+        f"Conversation turn: {intent_result}",
+        extra={
+            "event": "conversation_turn",
+            "session_id": session_id,
+            # New primary fields for Power BI
+            "user_query": user_query,
+            "intent_result": intent_result,
+            "intent_confidence": round(intent_confidence, 2) if intent_confidence else None,
+            # Results
+            "products_found": products_found,
+            "products_shown": products_shown,
+            "product_skus": skus_str,
+            # Filters (will be flattened by CSVHandler)
+            "filters": filters or {},
+            # Performance
+            "response_time_ms": round(response_time_ms, 2) if response_time_ms else None,
+            # Legacy field mappings for backwards compatibility
+            "query": user_query,
+            "intent": intent_result,
+            "confidence": round(intent_confidence, 2) if intent_confidence else None,
             **extra
         }
     )

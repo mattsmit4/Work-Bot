@@ -21,6 +21,7 @@ from core.filters import FilterExtractor
 from core.search import SearchStrategy
 from core.structured_logging import setup_logging, get_logger
 from core.orchestrator import process_query, OrchestratorComponents
+from core.gsheets_logger import init_gsheets_logger, GSPREAD_AVAILABLE
 from llm.query_analyzer import QueryAnalyzer
 from llm.product_ranker import ProductRanker
 from llm.response_builder import ResponseBuilder
@@ -33,17 +34,34 @@ from ui.logging import ConversationLogger
 # CONFIGURATION
 # =============================================================================
 
-DEBUG_MODE = False  # Set to True for development debugging
+DEBUG_MODE = True  # Set to True for development debugging
 
 # Initialize structured logging
+# Note: Detailed logging (stbot.log, daily CSVs) disabled.
+# Only logs/conversations.csv (Power BI) and logs/errors.log are used.
 setup_logging(
     log_dir="logs",
     console_level=20,  # INFO
     file_level=10,     # DEBUG
     enable_console=True,
-    enable_file=True,
+    enable_file=False,      # Disabled - using conversations.csv instead
+    enable_csv=False,       # Disabled - using conversations.csv instead
+    enable_error_log=True,  # Keep error logging for debugging issues
 )
 app_logger = get_logger("app")
+
+# Initialize Google Sheets logging for cloud deployment
+# Credentials are stored in Streamlit secrets (st.secrets["gsheets"])
+if GSPREAD_AVAILABLE:
+    try:
+        if "gsheets" in st.secrets:
+            gsheets_creds = dict(st.secrets["gsheets"])
+            spreadsheet_id = st.secrets.get("gsheets_spreadsheet_id", "")
+            if spreadsheet_id:
+                init_gsheets_logger(spreadsheet_id, gsheets_creds)
+                app_logger.info("Google Sheets logging initialized")
+    except Exception as e:
+        app_logger.warning(f"Google Sheets logging not configured: {e}")
 
 # Streamlit page config
 st.set_page_config(
@@ -84,12 +102,33 @@ def get_components(products) -> OrchestratorComponents:
             if 'category' in filter_dict and filter_dict['category']:
                 product_cat = product.metadata.get('category', '').lower()
                 search_cat = filter_dict['category'].lower()
-                if search_cat.endswith('s'):
-                    search_cat = search_cat[:-1]
-                if product_cat.endswith('s'):
+                # Normalize: replace underscores with spaces for consistent comparison
+                product_cat = product_cat.replace('_', ' ')
+                search_cat = search_cat.replace('_', ' ')
+                # Handle plural forms: "switches" -> "switch", "cables" -> "cable"
+                # Only strip "es" for words ending in "ches", "shes" (switch -> switches)
+                if search_cat.endswith('ches') or search_cat.endswith('shes'):
+                    search_cat = search_cat[:-2]  # switches -> switch
+                elif search_cat.endswith('s'):
+                    search_cat = search_cat[:-1]  # cables -> cable, enclosures -> enclosure
+                if product_cat.endswith('ches') or product_cat.endswith('shes'):
+                    product_cat = product_cat[:-2]
+                elif product_cat.endswith('s'):
                     product_cat = product_cat[:-1]
+                # Match logic:
+                # 1. Exact match always works
+                # 2. Suffix match (e.g., "server rack" matches "rack") ONLY for non-generic categories
+                #    Generic categories like "cable", "adapter" require exact match to prevent
+                #    "fiber cable" from matching generic "cable" products
+                generic_categories = {'cable', 'adapter', 'switch', 'card', 'enclosure'}
                 if product_cat != search_cat:
-                    match = False
+                    # Check if suffix match is allowed
+                    if product_cat in generic_categories:
+                        # Generic category requires exact match - no suffix matching
+                        match = False
+                    elif not search_cat.endswith(product_cat):
+                        # Non-generic category: allow suffix match (server rack -> rack)
+                        match = False
 
             # Connector filters
             if match and 'connector_from' in filter_dict and filter_dict['connector_from']:
