@@ -5,12 +5,16 @@ Coordinates the flow: intent classification → handler routing → response bui
 Simplified to 5 core intents and 3 handlers.
 """
 
-from typing import Any, List, Tuple
+import time
+from typing import Any, Dict, List, Optional, Tuple
 from dataclasses import dataclass
 
 from core.context import ConversationContext, Intent, IntentType, Product
 from core.intent import IntentClassifier
 from core.filters import FilterExtractor
+from core.structured_logging import log_conversation_turn
+from core.conversation_csv import log_conversation as log_conversation_csv
+from core.gsheets_logger import log_to_gsheets
 from ui.state import SessionState
 from ui.responses import ResponseFormatter
 from ui.logging import ConversationLogger
@@ -118,6 +122,9 @@ def process_query(
     Returns:
         Tuple of (response_text, intent_type_value)
     """
+    # Start timing for response
+    start_time = time.perf_counter()
+
     debug_lines = []
 
     # Debug: Show context state
@@ -178,14 +185,64 @@ def process_query(
         if debug_mode:
             debug_lines.append(f"💾 SAVED: {len(result.products_to_set)} products to context")
 
-    # Step 6: Log conversation
-    products_count = len(result.products_to_set) if result.products_to_set else 0
+    # Step 6: Log conversation (both structured and CSV logging)
+    # For logging, use products_to_set if handler set new products,
+    # otherwise fall back to context.current_products (for followups that discuss existing products)
+    products_for_logging = result.products_to_set if result.products_to_set else context.current_products
+    products_shown_count = len(products_for_logging) if products_for_logging else 0
+    product_skus = [p.product_number for p in products_for_logging] if products_for_logging else []
+    response_time_ms = (time.perf_counter() - start_time) * 1000
+
+    # Log to CSV legacy logger
     components.logger.log_conversation(
         session_id=session.session_id,
         user_message=query,
         bot_response=result.response,
         intent_type=intent.type.value,
-        products_shown=products_count
+        products_shown=products_shown_count
+    )
+
+    # Log comprehensive conversation turn for Power BI (to structured log)
+    log_conversation_turn(
+        session_id=session.session_id,
+        user_query=query,
+        intent_result=intent.type.value,
+        intent_confidence=intent.confidence,
+        products_found=result.products_found,
+        products_shown=products_shown_count,
+        product_skus=product_skus,
+        filters=result.filters_for_logging,
+        response_time_ms=response_time_ms
+    )
+
+    # Log to clean conversations.csv (one row per user interaction)
+    # Use result.response (clean response without debug header)
+    log_conversation_csv(
+        session_id=session.session_id,
+        user_query=query,
+        bot_response=result.response,
+        intent=intent.type.value,
+        confidence=intent.confidence,
+        filters=result.filters_for_logging,
+        products_found=result.products_found,
+        products_shown=products_shown_count,
+        product_skus=product_skus,
+        response_time_ms=response_time_ms
+    )
+
+    # Log to Google Sheets (for cloud deployment)
+    # This is a no-op if Google Sheets is not configured
+    log_to_gsheets(
+        session_id=session.session_id,
+        user_query=query,
+        bot_response=result.response,
+        intent=intent.type.value,
+        confidence=intent.confidence,
+        filters=result.filters_for_logging,
+        products_found=result.products_found,
+        products_shown=products_shown_count,
+        product_skus=product_skus,
+        response_time_ms=response_time_ms
     )
 
     # Step 7: Build final response
